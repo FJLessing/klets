@@ -1,10 +1,11 @@
 import { defineStore, acceptHMRUpdate } from "pinia";
 import { IpcService } from "@/services/ipc";
-import type { AppSnapshot, ProviderStatus, Settings } from "@/helpers/types";
+import type { AppSnapshot, AuthMode, ProviderStatus, Settings } from "@/helpers/types";
 
 interface SettingsState {
 	settings: Settings | null;
 	providers: ProviderStatus[];
+	defaultSystemPrompt: string;
 	isLoading: boolean;
 	isSaving: boolean;
 	error: string | null;
@@ -15,6 +16,7 @@ export const useSettingsStore = defineStore("settings", {
 	state: (): SettingsState => ({
 		settings: null,
 		providers: [],
+		defaultSystemPrompt: "",
 		isLoading: false,
 		isSaving: false,
 		error: null,
@@ -44,6 +46,7 @@ export const useSettingsStore = defineStore("settings", {
 		apply(snapshot: AppSnapshot) {
 			this.settings = snapshot.settings;
 			this.providers = snapshot.providers;
+			this.defaultSystemPrompt = snapshot.defaultSystemPrompt;
 		},
 
 		async load() {
@@ -66,9 +69,13 @@ export const useSettingsStore = defineStore("settings", {
 				this.apply(await IpcService.saveSettings({ ...this.settings, ...patch }));
 				this.notice = "Saved";
 			} catch (err) {
-				this.error = IpcService.errorMessage(err);
-				// Re-read so the UI never shows a value the core rejected.
+				const message = IpcService.errorMessage(err);
+				// Re-read so the UI never shows a value the core rejected —
+				// but `load()` itself clears `error` at its start (correctly,
+				// for a fresh standalone load), which would otherwise wipe
+				// this message before it's ever seen. Restore it after.
 				await this.load();
+				this.error = message;
 			} finally {
 				this.isSaving = false;
 			}
@@ -87,10 +94,23 @@ export const useSettingsStore = defineStore("settings", {
 			}
 		},
 
+		async setAuthMode(providerId: string, mode: AuthMode) {
+			this.isSaving = true;
+			this.error = null;
+			try {
+				this.apply(await IpcService.setAuthMode(providerId, mode));
+				this.notice = "Sign-in method updated";
+			} catch (err) {
+				this.error = IpcService.errorMessage(err);
+			} finally {
+				this.isSaving = false;
+			}
+		},
+
 		async setModel(providerId: string, model: string) {
 			if (!this.settings) return;
 			const providers = { ...this.settings.providers };
-			const current = providers[providerId] ?? { enabled: true, model: null };
+			const current = providers[providerId] ?? { enabled: true, model: null, authMode: null };
 			providers[providerId] = { ...current, model: model.trim() || null };
 			await this.save({ providers });
 		},
@@ -102,6 +122,20 @@ export const useSettingsStore = defineStore("settings", {
 				await IpcService.setActiveProvider(providerId);
 			} catch (err) {
 				this.error = IpcService.errorMessage(err);
+			}
+		},
+
+		/** Pass `null` to restore the managed scratch directory. */
+		async setWorkingDir(path: string | null) {
+			this.isSaving = true;
+			this.error = null;
+			try {
+				this.apply(await IpcService.setWorkingDir(path));
+				this.notice = path ? "Working directory updated" : "Restored the scratch directory";
+			} catch (err) {
+				this.error = IpcService.errorMessage(err);
+			} finally {
+				this.isSaving = false;
 			}
 		},
 	},

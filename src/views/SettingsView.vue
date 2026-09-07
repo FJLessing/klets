@@ -1,29 +1,85 @@
 <script lang="ts" setup>
-import { onMounted, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref } from "vue";
 import { IpcService } from "@/services/ipc";
 import { useSettingsStore } from "@/stores/settingsstore";
-import type { ProviderStatus } from "@/helpers/types";
+import { AuthMode, ToolPolicy, type ProviderStatus } from "@/helpers/types";
 
 const settingsStore = useSettingsStore();
 
 const keyDrafts = reactive<Record<string, string>>({});
 const modelDrafts = reactive<Record<string, string>>({});
 const capturingHotkey = ref(false);
+const promptDraft = ref("");
+
+const TOOL_POLICIES: Array<{ value: ToolPolicy; label: string; description: string }> = [
+	{ value: ToolPolicy.Off, label: "Off", description: "Answers come from the model alone." },
+	{
+		value: ToolPolicy.ReadOnly,
+		label: "Read-only",
+		description: "Reads, searches and fetches are allowed. Nothing runs.",
+	},
+	{
+		value: ToolPolicy.AskToRun,
+		label: "Ask to run",
+		description: "Reads happen freely; running a command asks first.",
+	},
+];
+
+const activePolicy = computed(
+	() => TOOL_POLICIES.find((p) => p.value === settingsStore.settings?.toolPolicy) ?? TOOL_POLICIES[2],
+);
+
+const promptDirty = computed(
+	() => promptDraft.value.trim() !== (settingsStore.settings?.systemPrompt ?? "").trim(),
+);
 
 async function refresh() {
 	await settingsStore.load();
 	settingsStore.providers.forEach((provider) => {
 		modelDrafts[provider.id] = provider.model ?? provider.defaultModel ?? "";
 	});
+	promptDraft.value = settingsStore.settings?.systemPrompt ?? "";
 }
 
 onMounted(refresh);
 
+async function setToolPolicy(policy: ToolPolicy) {
+	await settingsStore.save({ toolPolicy: policy });
+}
+
+async function savePrompt() {
+	await settingsStore.save({ systemPrompt: promptDraft.value });
+}
+
+async function resetPrompt() {
+	promptDraft.value = settingsStore.defaultSystemPrompt;
+	await settingsStore.save({ systemPrompt: promptDraft.value });
+}
+
+async function browseWorkingDir() {
+	const chosen = await IpcService.pickFolder(settingsStore.settings?.workingDir);
+	if (chosen) await settingsStore.setWorkingDir(chosen);
+}
+
+async function clearWorkingDir() {
+	await settingsStore.setWorkingDir(null);
+}
+
 function statusLabel(provider: ProviderStatus): string {
 	if (!provider.binaryPath) return "Not installed";
-	if (provider.hasApiKey) return "Ready · API key";
-	if (provider.authenticated) return "Ready · CLI login";
-	return "Needs sign-in";
+	if (!provider.authenticated) {
+		return provider.authMode === AuthMode.ApiKey ? "Needs API key" : "Needs sign-in";
+	}
+	return provider.authMode === AuthMode.ApiKey ? "Ready · API key" : "Ready · subscription";
+}
+
+function modeLabel(mode: AuthMode): string {
+	return mode === AuthMode.Subscription ? "Subscription" : "API key";
+}
+
+/** The key field only matters in API-key mode. */
+function needsKeyField(provider: ProviderStatus): boolean {
+	return provider.authMode === AuthMode.ApiKey;
 }
 
 async function saveKey(provider: ProviderStatus) {
@@ -69,8 +125,8 @@ async function toggle(field: "hideOnBlur" | "launchAtLogin", value: boolean) {
 		<header class="settings__header">
 			<h1 class="settings__title">Klets</h1>
 			<p class="settings__subtitle">
-				Quick answers from ACP agents. Klets never edits files or runs commands — tool
-				requests are always refused.
+				Quick answers from ACP agents. Edits are always refused; reads and running a
+				command are governed by the tool policy below.
 			</p>
 		</header>
 
@@ -124,6 +180,89 @@ async function toggle(field: "hideOnBlur" | "launchAtLogin", value: boolean) {
 		</section>
 
 		<section class="settings__section">
+			<h2 class="settings__heading">Tools</h2>
+
+			<div class="settings__row settings__row--stack">
+				<div>
+					<span class="settings__label">What agents are allowed to do</span>
+					<span class="settings__help">{{ activePolicy.description }}</span>
+				</div>
+				<div class="segmented">
+					<button
+						v-for="policy in TOOL_POLICIES"
+						:key="policy.value"
+						type="button"
+						class="segmented__option"
+						:class="{ 'segmented__option--active': policy.value === settingsStore.settings?.toolPolicy }"
+						:disabled="settingsStore.isSaving"
+						@click="setToolPolicy(policy.value)"
+					>
+						{{ policy.label }}
+					</button>
+				</div>
+			</div>
+
+			<div class="settings__row settings__row--stack">
+				<div>
+					<span class="settings__label">Working directory</span>
+					<span class="settings__help">
+						Reads are allowed here. Defaults to a folder Klets owns, so nothing real is
+						exposed until you choose one.
+					</span>
+				</div>
+				<div class="provider__input-row">
+					<input
+						type="text"
+						class="provider__input"
+						readonly
+						:value="settingsStore.settings?.workingDir || 'Managed scratch directory (default)'"
+					/>
+					<button type="button" class="provider__button" @click="browseWorkingDir">
+						Browse…
+					</button>
+					<button
+						v-if="settingsStore.settings?.workingDir"
+						type="button"
+						class="provider__button"
+						@click="clearWorkingDir"
+					>
+						Reset
+					</button>
+				</div>
+			</div>
+
+			<div class="settings__row settings__row--stack settings__row--last">
+				<div>
+					<span class="settings__label">System prompt</span>
+					<span class="settings__help">
+						Written into the working directory as AGENTS.md, CLAUDE.md and GEMINI.md at the
+						start of every session.
+					</span>
+				</div>
+				<textarea
+					v-model="promptDraft"
+					class="settings__prompt"
+					rows="7"
+					spellcheck="false"
+				></textarea>
+				<div class="settings__prompt-actions">
+					<button type="button" class="provider__link" @click="resetPrompt">
+						Reset to default
+					</button>
+					<span class="settings__spacer"></span>
+					<button
+						type="button"
+						class="provider__button"
+						:disabled="!promptDirty || settingsStore.isSaving"
+						@click="savePrompt"
+					>
+						Save
+					</button>
+				</div>
+			</div>
+		</section>
+
+		<section class="settings__section">
 			<div class="settings__section-header">
 				<h2 class="settings__heading">Providers</h2>
 				<button type="button" class="provider__link" @click="refresh">Re-scan</button>
@@ -148,17 +287,39 @@ async function toggle(field: "hideOnBlur" | "launchAtLogin", value: boolean) {
 					<code class="provider__code">{{ provider.installHint }}</code>
 				</p>
 				<template v-else>
-					<p class="provider__path">{{ provider.binaryPath }}</p>
-					<p v-if="!provider.authenticated" class="provider__install">
-						Sign in from a terminal, or paste an API key below:
+					<p class="provider__path">
+						{{ provider.binaryPath }}
+						<span v-if="provider.runsVia" class="provider__via">
+							· runs through {{ provider.runsVia }}
+						</span>
+					</p>
+
+					<div v-if="provider.authModes.length > 1" class="provider__modes">
+						<button
+							v-for="mode in provider.authModes"
+							:key="mode"
+							type="button"
+							class="provider__mode"
+							:class="{ 'provider__mode--active': mode === provider.authMode }"
+							:disabled="settingsStore.isSaving"
+							@click="settingsStore.setAuthMode(provider.id, mode)"
+						>
+							{{ modeLabel(mode) }}
+						</button>
+					</div>
+
+					<p
+						v-if="!provider.authenticated && provider.authMode === AuthMode.Subscription"
+						class="provider__install"
+					>
+						Sign in from a terminal:
 						<code class="provider__code">{{ provider.loginHint }}</code>
 					</p>
 				</template>
 
-				<div class="provider__field">
+				<div v-if="provider.binaryPath && needsKeyField(provider)" class="provider__field">
 					<label class="provider__label" :for="`key-${provider.id}`">
-						{{ provider.keyLabel }} — optional if you already ran
-						<code class="provider__inline-code">{{ provider.loginHint }}</code>
+						{{ provider.keyLabel }}
 					</label>
 					<div class="provider__input-row">
 						<input
@@ -327,6 +488,69 @@ async function toggle(field: "hideOnBlur" | "launchAtLogin", value: boolean) {
 	cursor: pointer;
 }
 
+.settings__row--stack {
+	flex-direction: column;
+	align-items: stretch;
+	gap: 0.5rem;
+}
+
+.settings__row--last {
+	border-bottom: none;
+}
+
+.segmented {
+	display: inline-flex;
+	align-self: flex-start;
+	padding: 0.15rem;
+	background: var(--surface-raised);
+	border: 0.0625rem solid var(--border);
+	border-radius: 0.45rem;
+}
+
+.segmented__option {
+	padding: 0.3rem 0.75rem;
+	font-family: inherit;
+	font-size: 0.8rem;
+	color: var(--text-muted);
+	background: none;
+	border: none;
+	border-radius: 0.35rem;
+	cursor: pointer;
+}
+
+.segmented__option--active {
+	color: var(--text);
+	background: var(--surface-hover);
+}
+
+.segmented__option:disabled {
+	cursor: default;
+}
+
+.settings__prompt {
+	width: 100%;
+	padding: 0.6rem 0.7rem;
+	font-family: var(--font-mono);
+	font-size: 0.82rem;
+	line-height: 1.5;
+	color: var(--text);
+	background: var(--surface-raised);
+	border: 0.0625rem solid var(--border-strong);
+	border-radius: 0.5rem;
+	resize: vertical;
+	outline: none;
+}
+
+.settings__prompt:focus {
+	border-color: var(--accent);
+}
+
+.settings__prompt-actions {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+}
+
 .provider {
 	margin-bottom: 1rem;
 	padding: 0.9rem 1rem;
@@ -445,10 +669,37 @@ async function toggle(field: "hideOnBlur" | "launchAtLogin", value: boolean) {
 	cursor: default;
 }
 
-.provider__inline-code {
-	font-family: var(--font-mono);
-	font-size: 0.72rem;
+.provider__via {
+	color: var(--text-faint);
+}
+
+.provider__modes {
+	display: inline-flex;
+	margin-bottom: 0.5rem;
+	padding: 0.15rem;
+	background: var(--surface);
+	border: 0.0625rem solid var(--border);
+	border-radius: 0.45rem;
+}
+
+.provider__mode {
+	padding: 0.25rem 0.7rem;
+	font-family: inherit;
+	font-size: 0.78rem;
+	color: var(--text-muted);
+	background: none;
+	border: none;
+	border-radius: 0.35rem;
+	cursor: pointer;
+}
+
+.provider__mode--active {
 	color: var(--text);
+	background: var(--surface-hover);
+}
+
+.provider__mode:disabled {
+	cursor: default;
 }
 
 .provider__link {

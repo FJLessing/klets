@@ -10,10 +10,12 @@ const chatStore = useChatStore();
 const settingsStore = useSettingsStore();
 
 const input = ref<HTMLTextAreaElement | null>(null);
+const frame = ref<HTMLElement | null>(null);
 const shell = ref<HTMLElement | null>(null);
 const transcript = ref<HTMLElement | null>(null);
 const draft = ref("");
 const showProviders = ref(false);
+const showCommands = ref(false);
 
 const unlisteners: UnlistenFn[] = [];
 
@@ -26,11 +28,57 @@ const canSend = computed(
 	() => draft.value.trim().length > 0 && !chatStore.isStreaming && settingsStore.hasAnyProvider,
 );
 
-/** Grow the window with the content instead of scrolling a fixed-size box. */
+/**
+ * Grow the window with the content instead of scrolling a fixed-size box.
+ *
+ * `scrollHeight` is the card's full content height even while `max-height`
+ * constrains it, so the window keeps requesting the size the content wants and
+ * the Rust side decides where to stop. The frame's padding is added on top so
+ * the shadow is never clipped.
+ */
+let heightFrame = 0;
+let lastRequestedHeight = 0;
+
+/**
+ * Coalesce height updates to one per frame.
+ *
+ * Streaming fires a change per token, and each resize is a window-manager
+ * operation, so measuring on every one is both wasteful and visibly jittery.
+ */
+function scheduleWindowHeight() {
+	if (heightFrame) return;
+	heightFrame = requestAnimationFrame(() => {
+		heightFrame = 0;
+		void syncWindowHeight();
+	});
+}
+
 async function syncWindowHeight() {
 	await nextTick();
-	const height = shell.value?.scrollHeight ?? 0;
-	if (height > 0) await IpcService.resizeLauncher(height);
+	const card = shell.value;
+	const gutter = frame.value;
+	if (!card || !gutter) return;
+
+	const style = getComputedStyle(gutter);
+	const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+
+	// The transcript is its own scroll container, so once it starts scrolling
+	// its overflow stops showing up in the card's scrollHeight. Measuring the
+	// card alone therefore reports the size it already is, and the window can
+	// never grow past whatever made it scroll — so measure the chrome and the
+	// transcript's true content height separately.
+	const list = transcript.value;
+	const wanted = list
+		? card.offsetHeight - list.clientHeight + list.scrollHeight
+		: card.scrollHeight;
+
+	if (wanted <= 0) return;
+
+	const target = Math.round(wanted + padding);
+	if (target === lastRequestedHeight) return;
+
+	lastRequestedHeight = target;
+	await IpcService.resizeLauncher(target);
 }
 
 async function scrollToBottom() {
@@ -78,6 +126,10 @@ async function onKeydown(event: KeyboardEvent) {
 
 	if (event.key === "Escape") {
 		event.preventDefault();
+		if (showCommands.value) {
+			showCommands.value = false;
+			return;
+		}
 		if (showProviders.value) {
 			showProviders.value = false;
 			return;
@@ -130,6 +182,16 @@ async function pickProvider(id: string) {
 	focusInput();
 }
 
+function toggleProviders() {
+	showCommands.value = false;
+	showProviders.value = !showProviders.value;
+}
+
+function toggleCommands() {
+	showProviders.value = false;
+	showCommands.value = !showCommands.value;
+}
+
 onMounted(async () => {
 	window.addEventListener("keydown", onKeydown);
 	await settingsStore.load();
@@ -148,140 +210,195 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
 	window.removeEventListener("keydown", onKeydown);
+	if (heightFrame) cancelAnimationFrame(heightFrame);
 	unlisteners.forEach((unlisten) => unlisten());
 });
 
 watch(
 	() => [chatStore.messages.length, chatStore.currentMessage?.text],
 	async () => {
-		await syncWindowHeight();
+		scheduleWindowHeight();
 		await scrollToBottom();
 	},
 );
 
 watch(draft, autoGrowInput);
 
-// The provider list is part of the layout, so the window has to grow for it.
-watch(showProviders, syncWindowHeight);
+// Both panels are part of the layout, so the window has to grow for them.
+watch([showProviders, showCommands], syncWindowHeight);
 </script>
 
 <template>
-	<div ref="shell" class="launcher">
-		<div class="launcher__bar">
-			<svg class="launcher__glyph" viewBox="0 0 24 24" aria-hidden="true">
-				<path
-					d="M12 3c4.97 0 9 3.36 9 7.5s-4.03 7.5-9 7.5c-.9 0-1.77-.11-2.59-.32L5 20.5l.94-3.2C4.13 15.93 3 13.83 3 11.5 3 7.36 7.03 3 12 3z"
-					fill="none"
-					stroke="currentColor"
-					stroke-width="1.6"
-					stroke-linejoin="round"
-				/>
-			</svg>
+	<!--
+		The frame is transparent padding that gives the card's shadow somewhere
+		to fall. Without it the window is sized flush to the card and the OS
+		clips the shadow into a hard-edged band.
+	-->
+	<div ref="frame" class="launcher-frame">
+		<div ref="shell" class="launcher">
+			<div class="launcher__bar">
+				<svg class="launcher__glyph" viewBox="0 0 24 24" aria-hidden="true">
+					<path
+						d="M12 3c4.97 0 9 3.36 9 7.5s-4.03 7.5-9 7.5c-.9 0-1.77-.11-2.59-.32L5 20.5l.94-3.2C4.13 15.93 3 13.83 3 11.5 3 7.36 7.03 3 12 3z"
+						fill="none"
+						stroke="currentColor"
+						stroke-width="1.6"
+						stroke-linejoin="round"
+					/>
+				</svg>
 
-			<textarea
-				ref="input"
-				v-model="draft"
-				class="launcher__input"
-				:placeholder="placeholder"
-				rows="1"
-				spellcheck="false"
-				autocomplete="off"
-			></textarea>
+				<textarea
+					ref="input"
+					v-model="draft"
+					class="launcher__input"
+					:placeholder="placeholder"
+					rows="1"
+					spellcheck="false"
+					autocomplete="off"
+				></textarea>
 
-			<button
-				v-if="chatStore.isStreaming"
-				type="button"
-				class="launcher__action launcher__action--stop"
-				title="Stop (Esc)"
-				@click="chatStore.cancel()"
-			>
-				Stop
-			</button>
+				<button
+					v-if="chatStore.isStreaming"
+					type="button"
+					class="launcher__action launcher__action--stop"
+					title="Stop (Esc)"
+					@click="chatStore.cancel()"
+				>
+					Stop
+				</button>
 
-			<button
-				type="button"
-				class="launcher__action"
-				:title="`Provider: ${settingsStore.activeProvider?.name ?? 'none'}`"
-				@click="showProviders = !showProviders"
-			>
-				{{ settingsStore.activeProvider?.name ?? "Set up" }}
-			</button>
-		</div>
+				<button
+					v-if="chatStore.commands.length"
+					type="button"
+					class="launcher__action"
+					:title="`${chatStore.commands.length} tools this agent can use`"
+					@click="toggleCommands"
+				>
+					{{ chatStore.commands.length }} tools
+				</button>
 
-		<!--
-			Rendered in flow rather than as an overlay: the launcher window is
-			sized to its content, so an absolutely positioned menu would be
-			clipped by the window frame.
-		-->
-		<ul v-if="showProviders" class="launcher__menu">
-			<li v-for="provider in settingsStore.readyProviders" :key="provider.id">
 				<button
 					type="button"
-					class="launcher__menu-item"
-					:class="{
-						'launcher__menu-item--active':
-							provider.id === settingsStore.settings?.activeProvider,
-					}"
-					@click="pickProvider(provider.id)"
+					class="launcher__action"
+					:title="`Provider: ${settingsStore.activeProvider?.name ?? 'none'}`"
+					@click="toggleProviders"
 				>
-					<span>{{ provider.name }}</span>
-					<span v-if="provider.model" class="launcher__menu-hint">
-						{{ provider.model.split("/").pop() }}
-					</span>
+					{{ settingsStore.activeProvider?.name ?? "Set up" }}
 				</button>
-			</li>
-			<li v-if="!settingsStore.readyProviders.length" class="launcher__menu-empty">
-				No agents are installed yet.
-			</li>
-			<li class="launcher__menu-divider"></li>
-			<li>
-				<button type="button" class="launcher__menu-item" @click="IpcService.openSettings()">
-					Settings…
+			</div>
+
+			<!--
+				Rendered in flow rather than as an overlay: the launcher window is
+				sized to its content, so an absolutely positioned menu would be
+				clipped by the window frame.
+			-->
+			<ul v-if="showProviders" class="launcher__menu">
+				<li v-for="provider in settingsStore.readyProviders" :key="provider.id">
+					<button
+						type="button"
+						class="launcher__menu-item"
+						:class="{
+							'launcher__menu-item--active':
+								provider.id === settingsStore.settings?.activeProvider,
+						}"
+						@click="pickProvider(provider.id)"
+					>
+						<span>{{ provider.name }}</span>
+						<span v-if="provider.model" class="launcher__menu-hint">
+							{{ provider.model.split("/").pop() }}
+						</span>
+					</button>
+				</li>
+				<li v-if="!settingsStore.readyProviders.length" class="launcher__menu-empty">
+					No agents are installed yet.
+				</li>
+				<li class="launcher__menu-divider"></li>
+				<li>
+					<button type="button" class="launcher__menu-item" @click="IpcService.openSettings()">
+						Settings…
+					</button>
+				</li>
+			</ul>
+
+			<!--
+				What the agent actually loaded — its own MCP servers and skills,
+				not anything Klets configures. Capped and independently
+				scrollable so a long list (Claude commonly reports 100+) never
+				forces the window past its own maximum height.
+			-->
+			<div v-if="showCommands" class="launcher__commands">
+				<p class="launcher__commands-hint">
+					Discovered from {{ settingsStore.activeProvider?.name }}'s own config:
+				</p>
+				<ul class="launcher__commands-list">
+					<li v-for="command in chatStore.commands" :key="command.name">
+						<span class="launcher__command-name">/{{ command.name }}</span>
+						<span v-if="command.description" class="launcher__command-desc">
+							{{ command.description }}
+						</span>
+					</li>
+				</ul>
+			</div>
+
+			<div v-if="chatStore.statusLabel" class="launcher__status">
+				{{ chatStore.statusLabel }}
+			</div>
+
+			<div v-if="!chatStore.isEmpty" ref="transcript" class="launcher__transcript">
+				<ChatMessageItem
+					v-for="message in chatStore.messages"
+					:key="message.id"
+					:message="message"
+				/>
+			</div>
+
+			<div v-if="!chatStore.isEmpty" class="launcher__footer">
+				<button type="button" class="launcher__hint-button" @click="newChat">New chat</button>
+				<span class="launcher__hint">Ctrl+N</span>
+				<span class="launcher__spacer"></span>
+				<span class="launcher__hint">Esc to close</span>
+			</div>
+
+			<div v-else-if="!settingsStore.hasAnyProvider && !settingsStore.isLoading" class="launcher__setup">
+				No agent is ready yet.
+				<button type="button" class="launcher__hint-button" @click="IpcService.openSettings()">
+					Open settings
 				</button>
-			</li>
-		</ul>
-
-		<div v-if="chatStore.statusLabel" class="launcher__status">
-			{{ chatStore.statusLabel }}
-		</div>
-
-		<div v-if="!chatStore.isEmpty" ref="transcript" class="launcher__transcript">
-			<ChatMessageItem
-				v-for="message in chatStore.messages"
-				:key="message.id"
-				:message="message"
-			/>
-		</div>
-
-		<div v-if="!chatStore.isEmpty" class="launcher__footer">
-			<button type="button" class="launcher__hint-button" @click="newChat">New chat</button>
-			<span class="launcher__hint">Ctrl+N</span>
-			<span class="launcher__spacer"></span>
-			<span class="launcher__hint">Esc to close</span>
-		</div>
-
-		<div v-else-if="!settingsStore.hasAnyProvider && !settingsStore.isLoading" class="launcher__setup">
-			No agent is ready yet.
-			<button type="button" class="launcher__hint-button" @click="IpcService.openSettings()">
-				Open settings
-			</button>
+			</div>
 		</div>
 	</div>
 </template>
 
 <style scoped>
+/*
+ * Transparent gutter around the card. Its size must stay in step with the
+ * card's box-shadow, and `syncWindowHeight` adds it to the requested window
+ * height so the shadow always has room to fade out.
+ */
+.launcher-frame {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	padding: 1.25rem 1.75rem 2.25rem;
+}
+
 .launcher {
 	display: flex;
 	flex-direction: column;
+	/* Cap at the frame so long answers scroll inside the card rather than
+	   overflowing past the bottom of the window. */
+	max-height: 100%;
 	overflow: hidden;
 	background: var(--surface);
 	border: 0.0625rem solid var(--border-strong);
 	border-radius: 0.9rem;
-	box-shadow: 0 1.5rem 3rem rgba(0, 0, 0, 0.45);
+	box-shadow: 0 0.75rem 2rem rgba(0, 0, 0, 0.5);
 }
 
 .launcher__bar {
 	display: flex;
+	/* Chrome keeps its size; only the transcript gives way. */
+	flex: none;
 	align-items: flex-start;
 	gap: 0.6rem;
 	padding: 0.85rem 0.9rem;
@@ -338,6 +455,7 @@ watch(showProviders, syncWindowHeight);
 }
 
 .launcher__menu {
+	flex: none;
 	margin: 0;
 	padding: 0.3rem 0.55rem 0.5rem;
 	list-style: none;
@@ -386,14 +504,70 @@ watch(showProviders, syncWindowHeight);
 	background: var(--border);
 }
 
+.launcher__commands {
+	flex: none;
+	padding: 0.6rem 0.9rem 0.2rem;
+	border-top: 0.0625rem solid var(--border);
+}
+
+.launcher__commands-hint {
+	margin: 0 0 0.4rem;
+	font-size: 0.74rem;
+	color: var(--text-faint);
+}
+
+.launcher__commands-list {
+	/*
+	 * Capped and independently scrollable, unlike the transcript: a long
+	 * discovery list (Claude commonly reports 100+ commands) should not force
+	 * the window toward its own maximum height on its own.
+	 */
+	max-height: 13rem;
+	margin: 0 0 0.5rem;
+	padding: 0;
+	overflow-y: auto;
+	list-style: none;
+}
+
+.launcher__commands-list li {
+	display: flex;
+	flex-direction: column;
+	gap: 0.1rem;
+	padding: 0.3rem 0.1rem;
+}
+
+.launcher__commands-list li + li {
+	border-top: 0.0625rem solid var(--border);
+}
+
+.launcher__command-name {
+	font-family: var(--font-mono);
+	font-size: 0.78rem;
+	color: var(--accent-text);
+}
+
+.launcher__command-desc {
+	font-size: 0.74rem;
+	line-height: 1.4;
+	color: var(--text-faint);
+}
+
 .launcher__status {
+	flex: none;
 	padding: 0 0.9rem 0.7rem 2.75rem;
 	font-size: 0.78rem;
 	color: var(--text-faint);
 }
 
 .launcher__transcript {
-	flex: 1;
+	/*
+	 * Basis must stay `auto`, not 0: the card is content-sized until it hits
+	 * its max-height, and a zero-basis item contributes no height to an
+	 * auto-height flex container, so the transcript would collapse to nothing.
+	 * `min-height: 0` then lets it shrink and scroll once the cap is reached.
+	 */
+	flex: 1 1 auto;
+	min-height: 0;
 	overflow-y: auto;
 	padding: 0.4rem 0.9rem 0;
 	border-top: 0.0625rem solid var(--border);
@@ -402,6 +576,7 @@ watch(showProviders, syncWindowHeight);
 .launcher__footer,
 .launcher__setup {
 	display: flex;
+	flex: none;
 	align-items: center;
 	gap: 0.5rem;
 	padding: 0.5rem 0.9rem;

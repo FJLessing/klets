@@ -1,9 +1,17 @@
 import { defineStore, acceptHMRUpdate } from "pinia";
 import { IpcService } from "@/services/ipc";
-import { AgentState, MessageRole, type AgentEvent, type ChatMessage } from "@/helpers/types";
+import {
+	AgentState,
+	MessageRole,
+	type AgentCommandInfo,
+	type AgentEvent,
+	type ChatMessage,
+} from "@/helpers/types";
 
 interface ChatState {
 	messages: ChatMessage[];
+	/** Commands and skills the connected agent advertises. */
+	commands: AgentCommandInfo[];
 	agentState: AgentState;
 	agentDetail: string | null;
 	activeTurn: number | null;
@@ -20,6 +28,7 @@ function blankAgentMessage(id: number): ChatMessage {
 		thoughts: "",
 		tools: [],
 		notices: [],
+		permissions: [],
 		error: null,
 		streaming: true,
 	};
@@ -28,6 +37,7 @@ function blankAgentMessage(id: number): ChatMessage {
 export const useChatStore = defineStore("chat", {
 	state: (): ChatState => ({
 		messages: [],
+		commands: [],
 		agentState: AgentState.Stopped,
 		agentDetail: null,
 		activeTurn: null,
@@ -71,6 +81,7 @@ export const useChatStore = defineStore("chat", {
 				thoughts: "",
 				tools: [],
 				notices: [],
+				permissions: [],
 				error: null,
 				streaming: false,
 			});
@@ -104,6 +115,9 @@ export const useChatStore = defineStore("chat", {
 			this.messages = [];
 			this.activeTurn = null;
 			this.error = null;
+			// A new chat may run on a different agent, so its list of tools
+			// from the last one is no longer accurate.
+			this.commands = [];
 			try {
 				await IpcService.newChat();
 			} catch (err) {
@@ -122,10 +136,50 @@ export const useChatStore = defineStore("chat", {
 				return;
 			}
 
+			// Whatever the agent reports it can do, which is the only reliable
+			// view of the MCP servers and skills it loaded from its own config.
+			if (event.type === "capabilities") {
+				this.commands = event.commands;
+				return;
+			}
+
 			const message = this.currentMessage;
+			if (!message) return;
+
+			// Notices describe the session rather than the turn (an unavailable
+			// model, for example), so they attach even after a turn closes.
+			if (event.type === "notice") {
+				message.notices.push(event.message);
+				return;
+			}
+
+			// A pending decision must render — and resolve — even if the turn
+			// is being torn down. Cancelling a turn (or the agent crashing)
+			// resolves any outstanding permission via the broker's `clear()`,
+			// which races against the `done`/`error` that closes the message;
+			// if that race is lost, the resolution must still land, or the
+			// row is left showing live Allow/Deny buttons for a decision
+			// that's already been made.
+			if (event.type === "permissionRequest") {
+				message.permissions.push(event.request);
+				return;
+			}
+
+			if (event.type === "permissionResolved") {
+				const pending = message.permissions.find((p) => p.id === event.id);
+				if (pending) {
+					pending.outcome = event.timedOut
+						? "timedOut"
+						: event.allowed
+							? "allowed"
+							: "denied";
+				}
+				return;
+			}
+
 			// Late events from a cancelled turn must not append to a bubble
 			// that has already been closed off.
-			if (!message || !message.streaming) return;
+			if (!message.streaming) return;
 
 			switch (event.type) {
 				case "chunk":
@@ -152,7 +206,7 @@ export const useChatStore = defineStore("chat", {
 				}
 				case "permissionDenied":
 					message.notices.push(
-						`Blocked ${event.title} — Klets answers questions and never runs tools.`,
+						`Refused ${event.title} — Klets does not allow ${event.kind} operations.`,
 					);
 					break;
 				case "done":

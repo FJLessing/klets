@@ -27,4 +27,10 @@ export default defineConfig(async () => ({
 			ignored: ["**/src-tauri/**"],
 		},
 	},
+	test: {
+		// Everything under test is pure logic (Pinia stores, markdown
+		// rendering) with the Tauri glue mocked out, so no DOM is needed.
+		environment: "node",
+		include: ["src/**/*.test.ts"],
+	},
 }));

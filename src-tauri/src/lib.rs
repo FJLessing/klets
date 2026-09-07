@@ -2,10 +2,11 @@ pub mod agent;
 mod commands;
 pub mod error;
 pub mod events;
+pub mod permissions;
 pub mod providers;
 pub mod settings;
 mod shortcuts;
-mod windows;
+pub mod windows;
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -24,6 +25,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
@@ -38,9 +40,12 @@ pub fn run() {
             commands::get_snapshot,
             commands::save_settings,
             commands::set_api_key,
+            commands::set_auth_mode,
             commands::set_active_provider,
             commands::send_prompt,
             commands::cancel_turn,
+            commands::respond_permission,
+            commands::set_working_dir,
             commands::new_chat,
             commands::hide_launcher,
             commands::open_settings,
@@ -67,8 +72,14 @@ pub fn run() {
             // an agent counts as usable if it is installed and can sign in,
             // whether that is a saved key or its own CLI login.
             let usable = providers::PROVIDERS.iter().any(|spec| {
+                let keys = providers::SavedKeys {
+                    api_key: settings::has_api_key(spec.key_id),
+                    subscription_token: spec
+                        .subscription_key_id
+                        .is_some_and(settings::has_api_key),
+                };
                 providers::resolve_binary(spec.command).is_some()
-                    && spec.is_authenticated(settings::has_api_key(spec.key_id))
+                    && spec.is_authenticated(stored.auth_mode_for(spec), &keys)
             });
             if usable {
                 windows::show_launcher(&handle);

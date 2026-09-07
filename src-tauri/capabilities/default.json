@@ -22,6 +22,7 @@
 		"core:event:allow-unlisten",
 		"core:app:allow-version",
 		"opener:allow-open-url",
+		"dialog:allow-open",
 		"store:default",
 		"autostart:default",
 		"global-shortcut:default"

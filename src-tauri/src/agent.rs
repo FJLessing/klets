@@ -8,7 +8,7 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -17,8 +17,9 @@ use agent_client_protocol::{
     Agent as _, CancelNotification, Client, ClientSideConnection, ContentBlock, Error as AcpError,
     InitializeRequest, ModelId, NewSessionRequest, PromptRequest, ProtocolVersion,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SessionConfigOptionCategory, SessionConfigValueId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModelRequest, TextContent,
+    SelectedPermissionOutcome,
+    SessionConfigKind, SessionConfigOptionCategory, SessionConfigValueId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModelRequest, TextContent,
 };
 use tauri::AppHandle;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -26,9 +27,10 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::error::{AppError, AppResult};
-use crate::events::{AgentEvent, AgentState, EventSink};
+use crate::events::{AgentCommandInfo, AgentEvent, AgentState, EventSink};
+use crate::permissions::{self, PermissionBroker, ToolPolicy};
 use crate::providers::{self, ProviderSpec};
-use crate::settings::{self, Settings};
+use crate::settings::{self, AuthMode, Settings};
 
 /// Messages sent from Tauri commands to the agent thread.
 #[derive(Debug)]
@@ -48,8 +50,16 @@ pub struct LaunchPlan {
     pub binary: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Inherited variables to clear before spawning.
+    pub unset_env: Vec<String>,
     pub cwd: PathBuf,
     pub model: Option<String>,
+    /// What the agent is allowed to do during the session.
+    pub tool_policy: ToolPolicy,
+    /// Instructions written into the session directory before the handshake.
+    pub system_prompt: String,
+    /// False when the model was already fixed on the command line.
+    pub select_model_over_acp: bool,
     /// Command that signs the user in, quoted back when auth fails.
     pub login_hint: String,
 }
@@ -64,30 +74,132 @@ impl LaunchPlan {
             }
         })?;
 
-        // The key is optional: every one of these agents can also run on the
-        // credentials from its own `login` flow, so an empty keychain entry
-        // means "let the CLI authenticate itself".
-        let key = settings::get_api_key(spec.key_id);
-
-        let cwd = settings::workspace_dir(app)?;
+        let cwd = settings.session_dir(app)?;
         let model = settings.model_for(spec);
+        let mode = settings.auth_mode_for(spec);
 
         let mut env = Vec::new();
-        if let Some(key) = key {
-            env.push((spec.env_var.to_string(), key));
+        let mut unset_env = Vec::new();
+
+        match mode {
+            AuthMode::ApiKey => {
+                if let Some(key) = settings::get_api_key(spec.key_id) {
+                    env.push((spec.env_var.to_string(), key));
+                }
+            }
+            AuthMode::Subscription => {
+                // An inherited API key would quietly switch the agent from the
+                // user's subscription to per-token billing, so clear it.
+                unset_env.push(spec.env_var.to_string());
+
+                if let (Some(var), Some(key_id)) =
+                    (spec.subscription_env_var, spec.subscription_key_id)
+                {
+                    if let Some(token) = settings::get_api_key(key_id) {
+                        env.push((var.to_string(), token));
+                    }
+                }
+            }
+        }
+
+        // gemini-cli pins its sign-in method in a settings file with no CLI
+        // override, so Klets points it at a private one for this process only.
+        if mode == AuthMode::ApiKey {
+            if let Some(providers::AuthSettingsOverride::GeminiCli) = spec.auth_settings_override {
+                let path = write_gemini_settings(app)?;
+                env.push((
+                    "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
+                    path.to_string_lossy().to_string(),
+                ));
+            }
+        }
+
+        let mut args: Vec<String> = spec.args.iter().map(|a| a.to_string()).collect();
+
+        // Agents without ACP model selection take the model as an argument.
+        let mut select_model_over_acp = true;
+        if let (Some(flag), Some(model)) = (spec.model_flag, model.as_ref()) {
+            args.push(flag.to_string());
+            args.push(model.clone());
+            select_model_over_acp = false;
         }
 
         Ok(Self {
             provider_id: spec.id.to_string(),
             provider_name: spec.name.to_string(),
             binary,
-            args: spec.args.iter().map(|a| a.to_string()).collect(),
+            args,
             env,
+            unset_env,
             cwd,
             model,
+            tool_policy: settings.tool_policy,
+            system_prompt: settings.system_prompt.clone(),
+            select_model_over_acp,
             login_hint: spec.login_hint.to_string(),
         })
     }
+}
+
+/// Instruction files the agents read from their working directory.
+///
+/// Each agent looks for a different name, and they all read plain markdown, so
+/// the same prompt is written under every name rather than maintaining one per
+/// provider.
+const INSTRUCTION_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", "GEMINI.md"];
+
+/// Put the user's prompt where the agent will find it.
+///
+/// Returns the files written so they can be cleaned up: when the session
+/// directory is a real project, leaving a `CLAUDE.md` behind would trample the
+/// user's own instructions.
+fn write_instructions(cwd: &Path, prompt: &str) -> Vec<PathBuf> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Vec::new();
+    }
+
+    let body = format!("{prompt}\n");
+    let mut written = Vec::new();
+
+    for name in INSTRUCTION_FILES {
+        let path = cwd.join(name);
+        // Never clobber instructions that already belong to the folder.
+        if path.exists() {
+            continue;
+        }
+        if std::fs::write(&path, &body).is_ok() {
+            written.push(path);
+        }
+    }
+
+    written
+}
+
+fn remove_instructions(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Write the settings file that forces gemini-cli onto API-key auth.
+///
+/// It is passed as gemini-cli's *system* settings, which outrank both user and
+/// workspace settings and are not gated behind folder trust. Auto-update is
+/// disabled too, since shadowing the real system file would otherwise re-enable
+/// it mid-session.
+fn write_gemini_settings(app: &AppHandle) -> AppResult<PathBuf> {
+    let dir = settings::managed_dir(app)?.join("gemini");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("settings.json");
+
+    let config = serde_json::json!({
+        "security": { "auth": { "selectedType": "gemini-api-key" } },
+        "general": { "enableAutoUpdate": false }
+    });
+
+    std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
+    Ok(path)
 }
 
 /// Handle to the running agent thread.
@@ -102,11 +214,17 @@ struct RunningAgent {
 pub struct AgentManager {
     current: Mutex<Option<RunningAgent>>,
     turn: Mutex<u64>,
+    /// Shared with the agent thread so the UI can answer its questions.
+    broker: PermissionBroker,
 }
 
 impl AgentManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn broker(&self) -> PermissionBroker {
+        self.broker.clone()
     }
 
     fn next_turn(&self) -> u64 {
@@ -144,9 +262,10 @@ impl AgentManager {
 
         let app_handle = app.clone();
         let thread_plan = plan.clone();
+        let thread_broker = self.broker.clone();
         std::thread::Builder::new()
             .name(format!("klets-agent-{}", plan.provider_id))
-            .spawn(move || run_agent_thread(app_handle, thread_plan, rx))
+            .spawn(move || run_agent_thread(app_handle, thread_plan, thread_broker, rx))
             .map_err(|e| AppError::Agent(format!("could not start agent thread: {e}")))?;
 
         *self.current.lock().expect("agent mutex") = Some(running);
@@ -174,6 +293,8 @@ impl AgentManager {
     }
 
     pub fn cancel(&self) {
+        // Nothing should stay blocked on a prompt for a turn being abandoned.
+        self.broker.clear();
         let current = self.current.lock().expect("agent mutex");
         if let Some(running) = current.as_ref() {
             let _ = running.tx.send(AgentCommand::Cancel);
@@ -191,6 +312,7 @@ impl AgentManager {
     }
 
     pub fn stop(&self) {
+        self.broker.clear();
         let mut current = self.current.lock().expect("agent mutex");
         if let Some(running) = current.take() {
             let _ = running.tx.send(AgentCommand::Shutdown);
@@ -227,6 +349,7 @@ fn emit_status<S: EventSink>(sink: &S, provider: &str, state: AgentState, detail
 pub fn run_agent_thread<S: EventSink>(
     sink: S,
     plan: LaunchPlan,
+    broker: PermissionBroker,
     rx: mpsc::UnboundedReceiver<AgentCommand>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -248,7 +371,7 @@ pub fn run_agent_thread<S: EventSink>(
     let sink_for_error = sink.clone();
 
     local.block_on(&runtime, async move {
-        if let Err(message) = drive_agent(sink, plan, rx).await {
+        if let Err(message) = drive_agent(sink, plan, broker, rx).await {
             emit(
                 &sink_for_error,
                 AgentEvent::Error {
@@ -272,9 +395,14 @@ pub fn run_agent_thread<S: EventSink>(
 async fn drive_agent<S: EventSink>(
     sink: S,
     plan: LaunchPlan,
+    broker: PermissionBroker,
     mut rx: mpsc::UnboundedReceiver<AgentCommand>,
 ) -> Result<(), String> {
     emit_status(&sink, &plan.provider_id, AgentState::Starting, None);
+
+    // Written before the agent starts, since instruction files are read when
+    // the session opens.
+    let instructions = write_instructions(&plan.cwd, &plan.system_prompt);
 
     let mut command = tokio::process::Command::new(&plan.binary);
     command
@@ -287,6 +415,9 @@ async fn drive_agent<S: EventSink>(
 
     for (key, value) in &plan.env {
         command.env(key, value);
+    }
+    for key in &plan.unset_env {
+        command.env_remove(key);
     }
 
     // Keep npm/.cmd shims from flashing a console window on Windows.
@@ -327,6 +458,9 @@ async fn drive_agent<S: EventSink>(
     let handler = KletsClient {
         sink: sink.clone(),
         turn: turn_cell.clone(),
+        provider_id: plan.provider_id.clone(),
+        policy: plan.tool_policy,
+        broker: broker.clone(),
     };
 
     let (connection, io_task) = ClientSideConnection::new(
@@ -370,8 +504,10 @@ async fn drive_agent<S: EventSink>(
 
     let mut session_id = session.session_id.clone();
 
-    if let Some(model) = plan.model.clone() {
-        select_model(&connection, &session, &session_id, &model).await;
+    if plan.select_model_over_acp {
+        if let Some(model) = plan.model.clone() {
+            select_model(&sink, 0, &connection, &session, &session_id, &model).await;
+        }
     }
 
     emit_status(&sink, &plan.provider_id, AgentState::Ready, None);
@@ -448,56 +584,98 @@ async fn drive_agent<S: EventSink>(
     }
 
     let _ = child.kill().await;
+    remove_instructions(&instructions);
     Ok(())
 }
 
 /// Point the session at a specific model.
 ///
-/// Agents advertise model choice in one of two ways: the unstable
-/// `session/set_model` route, or a `model` entry in the session's config
-/// options (what OpenCode does — which is how Go and Zen, one binary, are told
-/// apart). Both are tried, and an agent that supports neither keeps its
-/// default rather than failing the turn.
-async fn select_model(
+/// Agents advertise model choice in one of two ways: the `session/set_model`
+/// route, or a `model` entry in the session's config options (what OpenCode
+/// does — which is how Go, Zen and Gemini, all one binary, are told apart).
+///
+/// Failures are reported rather than swallowed. Silently falling back would
+/// leave the launcher claiming one model while another answered, which also
+/// hides the difference between the OpenCode-backed providers.
+async fn select_model<S: EventSink>(
+    sink: &S,
+    turn: u64,
     connection: &Rc<ClientSideConnection>,
     session: &agent_client_protocol::NewSessionResponse,
     session_id: &agent_client_protocol::SessionId,
     model: &str,
 ) {
-    let known_model = session.models.as_ref().is_some_and(|state| {
-        state
+    let notify = |message: String| emit(sink, AgentEvent::Notice { turn, message });
+
+    if let Some(state) = session.models.as_ref() {
+        if state
             .available_models
             .iter()
             .any(|m| m.model_id.0.as_ref() == model)
-    });
-
-    if known_model {
-        let _ = connection
-            .set_session_model(SetSessionModelRequest::new(
-                session_id.clone(),
-                ModelId::new(model.to_string()),
-            ))
-            .await;
-        return;
+        {
+            if let Err(e) = connection
+                .set_session_model(SetSessionModelRequest::new(
+                    session_id.clone(),
+                    ModelId::new(model.to_string()),
+                ))
+                .await
+            {
+                notify(format!("Could not switch to {model}: {}", e.message));
+            }
+            return;
+        }
     }
 
-    let Some(options) = session.config_options.as_ref() else {
+    let model_option = session.config_options.as_ref().and_then(|options| {
+        options.iter().find(|option| {
+            matches!(option.category, Some(SessionConfigOptionCategory::Model))
+                || option.id.0.as_ref() == "model"
+        })
+    });
+
+    let Some(option) = model_option else {
+        notify(format!(
+            "This agent does not support choosing a model, so {model} was ignored."
+        ));
         return;
     };
 
-    let model_option = options.iter().find(|option| {
-        matches!(option.category, Some(SessionConfigOptionCategory::Model))
-            || option.id.0.as_ref() == "model"
-    });
+    // The change is attempted even when the model is missing from the
+    // advertised list, because agents do not always advertise everything they
+    // accept. What matters is the value that comes back.
+    let response = connection
+        .set_session_config_option(SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            option.id.clone(),
+            SessionConfigValueId::new(model.to_string()),
+        ))
+        .await;
 
-    if let Some(option) = model_option {
-        let _ = connection
-            .set_session_config_option(SetSessionConfigOptionRequest::new(
-                session_id.clone(),
-                option.id.clone(),
-                SessionConfigValueId::new(model.to_string()),
-            ))
-            .await;
+    match response {
+        Ok(response) => {
+            let applied = response
+                .config_options
+                .iter()
+                .find(|updated| updated.id == option.id)
+                .and_then(|updated| match &updated.kind {
+                    SessionConfigKind::Select(select) => {
+                        Some(select.current_value.0.as_ref().to_string())
+                    }
+                    _ => None,
+                });
+
+            // Reading the value back is the only way to catch an agent that
+            // accepts the request but quietly keeps its own model.
+            if let Some(applied) = applied {
+                if applied != model {
+                    notify(format!(
+                        "{model} is unavailable, so {applied} answered instead. \
+                         Change the model in settings."
+                    ));
+                }
+            }
+        }
+        Err(e) => notify(format!("Could not switch to {model}: {}", e.message)),
     }
 }
 
@@ -539,6 +717,9 @@ fn stderr_snapshot(tail: &Arc<Mutex<VecDeque<String>>>) -> String {
 struct KletsClient<S: EventSink> {
     sink: S,
     turn: Rc<Cell<u64>>,
+    provider_id: String,
+    policy: ToolPolicy,
+    broker: PermissionBroker,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -547,23 +728,84 @@ impl<S: EventSink> Client for KletsClient<S> {
         &self,
         args: RequestPermissionRequest,
     ) -> Result<RequestPermissionResponse, AcpError> {
-        let title = args
-            .tool_call
-            .fields
-            .title
-            .unwrap_or_else(|| "a tool".to_string());
+        let turn = self.turn.get();
+        let fields = args.tool_call.fields;
+        let kind = fields.kind.unwrap_or_default();
+        let title = fields.title.unwrap_or_else(|| "a tool".to_string());
 
-        emit(
-            &self.sink,
-            AgentEvent::PermissionDenied {
-                turn: self.turn.get(),
-                title,
-            },
-        );
+        let respond = |allow: bool| {
+            let outcome = permissions::option_for(&args.options, allow)
+                .map(|id| RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)));
 
-        Ok(RequestPermissionResponse::new(
-            RequestPermissionOutcome::Cancelled,
-        ))
+            // An agent that offers no option of the right kind gets a cancel,
+            // which every adapter treats as "did not happen".
+            Ok(RequestPermissionResponse::new(
+                outcome.unwrap_or(RequestPermissionOutcome::Cancelled),
+            ))
+        };
+
+        match self.policy.decide(kind) {
+            permissions::Decision::Allow => respond(true),
+            permissions::Decision::Deny => {
+                emit(
+                    &self.sink,
+                    AgentEvent::PermissionDenied {
+                        turn,
+                        title,
+                        kind: as_str(&kind),
+                    },
+                );
+                respond(false)
+            }
+            permissions::Decision::Ask => {
+                let (id, receiver) = self.broker.register();
+
+                self.sink.attention();
+                emit(
+                    &self.sink,
+                    AgentEvent::PermissionRequest {
+                        turn,
+                        request: permissions::PendingPermission {
+                            id,
+                            title,
+                            kind: as_str(&kind),
+                            detail: permissions::describe_input(fields.raw_input.as_ref()),
+                        },
+                    },
+                );
+
+                // Refuse on the user's behalf if nobody answers, so a request
+                // raised while the launcher is hidden cannot stall the turn.
+                let allowed =
+                    match tokio::time::timeout(permissions::DECISION_TIMEOUT, receiver).await {
+                        Ok(Ok(decision)) => decision,
+                        _ => {
+                            self.broker.forget(id);
+                            emit(
+                                &self.sink,
+                                AgentEvent::PermissionResolved {
+                                    turn,
+                                    id,
+                                    allowed: false,
+                                    timed_out: true,
+                                },
+                            );
+                            return respond(false);
+                        }
+                    };
+
+                emit(
+                    &self.sink,
+                    AgentEvent::PermissionResolved {
+                        turn,
+                        id,
+                        allowed,
+                        timed_out: false,
+                    },
+                );
+                respond(allowed)
+            }
+        }
     }
 
     async fn session_notification(&self, args: SessionNotification) -> Result<(), AcpError> {
@@ -588,6 +830,22 @@ impl<S: EventSink> Client for KletsClient<S> {
                     title: call.title,
                     kind: as_str(&call.kind),
                     status: as_str(&call.status),
+                },
+            ),
+            // How Klets learns which MCP servers and skills are live: agents
+            // load those from their own config and announce the result here.
+            SessionUpdate::AvailableCommandsUpdate(update) => emit(
+                &self.sink,
+                AgentEvent::Capabilities {
+                    provider: self.provider_id.clone(),
+                    commands: update
+                        .available_commands
+                        .into_iter()
+                        .map(|command| AgentCommandInfo {
+                            name: command.name,
+                            description: command.description,
+                        })
+                        .collect(),
                 },
             ),
             SessionUpdate::ToolCallUpdate(update) => emit(

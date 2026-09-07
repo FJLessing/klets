@@ -1,16 +1,23 @@
 {
   "name": "klets",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Spotlight-style quick answers from ACP coding agents",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FJLessing/klets.git"
+  },
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
+    "test": "vitest run",
     "tauri": "tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.7.3",
     "@tauri-apps/plugin-opener": "^2",
     "highlight.js": "^11",
     "markdown-it": "^14",
@@ -23,6 +30,7 @@
     "@vitejs/plugin-vue": "^5",
     "typescript": "~5.8",
     "vite": "^6",
+    "vitest": "^5.0.0",
     "vue-tsc": "^2"
   }
 }

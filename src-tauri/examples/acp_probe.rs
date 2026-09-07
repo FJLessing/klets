@@ -20,6 +20,10 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 struct PrintSink {
     finished: std_mpsc::Sender<()>,
+    /// Answers approval prompts the way the UI would.
+    broker: klets_lib::permissions::PermissionBroker,
+    /// Tool kinds to approve, from KLETS_APPROVE.
+    approve: Vec<String>,
 }
 
 impl EventSink for PrintSink {
@@ -31,7 +35,35 @@ impl EventSink for PrintSink {
             AgentEvent::Chunk { text, .. } => print!("{text}"),
             AgentEvent::Thought { text, .. } => eprint!("\x1b[2m{text}\x1b[0m"),
             AgentEvent::Tool { title, status, .. } => println!("\n[tool] {title} ({status})"),
-            AgentEvent::PermissionDenied { title, .. } => println!("\n[denied] {title}"),
+            AgentEvent::PermissionDenied { title, kind, .. } => {
+                println!("\n[denied] {title} ({kind})")
+            }
+            AgentEvent::PermissionRequest { request, .. } => {
+                let allow = self.approve.iter().any(|k| k == &request.kind);
+                println!(
+                    "\n[ask] {} ({}){} -> {}",
+                    request.title,
+                    request.kind,
+                    request
+                        .detail
+                        .as_ref()
+                        .map(|d| format!(": {d}"))
+                        .unwrap_or_default(),
+                    if allow { "ALLOW" } else { "DENY" }
+                );
+                self.broker.resolve(request.id, allow);
+            }
+            AgentEvent::PermissionResolved { timed_out, .. } if timed_out => {
+                println!("\n[ask] timed out")
+            }
+            AgentEvent::PermissionResolved { .. } => {}
+            AgentEvent::Capabilities { commands, .. } => {
+                println!("[capabilities] {} commands available", commands.len());
+                for c in commands.iter().take(8) {
+                    println!("    /{}", c.name);
+                }
+            }
+            AgentEvent::Notice { message, .. } => println!("\n[notice] {message}"),
             AgentEvent::Done { stop_reason, .. } => {
                 println!("\n[done] {}", stop_reason.unwrap_or_default());
                 let _ = self.finished.send(());
@@ -63,15 +95,43 @@ fn main() {
     let cwd = std::env::temp_dir().join("klets-probe");
     std::fs::create_dir_all(&cwd).expect("workspace");
 
+    // Secrets are read straight from the Klets keychain and injected into the
+    // child, so a probe run never has to echo a key onto a command line.
+    let mut env = Vec::new();
+    if let (Ok(key_id), Ok(var)) = (std::env::var("KLETS_KEY_ID"), std::env::var("KLETS_KEY_ENV")) {
+        match klets_lib::settings::get_api_key(&key_id) {
+            Some(secret) => {
+                println!("[auth] injecting {var} from keychain entry '{key_id}'");
+                env.push((var, secret));
+            }
+            None => println!("[auth] no keychain entry '{key_id}' — continuing without it"),
+        }
+    }
+
+    let unset_env: Vec<String> = std::env::var("KLETS_UNSET")
+        .map(|raw| raw.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+    if !unset_env.is_empty() {
+        println!("[auth] clearing inherited {}", unset_env.join(", "));
+    }
+
     let plan = LaunchPlan {
         provider_id: binary.clone(),
         provider_name: binary.clone(),
         binary: klets_lib::providers::resolve_binary(binary)
             .unwrap_or_else(|| panic!("'{binary}' is not on PATH")),
         args: rest.to_vec(),
-        env: Vec::new(),
+        env,
+        unset_env,
         cwd,
         model: std::env::var("KLETS_MODEL").ok(),
+        tool_policy: match std::env::var("KLETS_POLICY").as_deref() {
+            Ok("off") => klets_lib::permissions::ToolPolicy::Off,
+            Ok("readonly") => klets_lib::permissions::ToolPolicy::ReadOnly,
+            _ => klets_lib::permissions::ToolPolicy::AskToRun,
+        },
+        system_prompt: std::env::var("KLETS_PROMPT").unwrap_or_default(),
+        select_model_over_acp: std::env::var("KLETS_MODEL_ARG").is_err(),
         login_hint: format!("{binary} login"),
     };
 
@@ -79,9 +139,16 @@ fn main() {
 
     let (finished_tx, finished_rx) = std_mpsc::channel();
     let (tx, rx) = mpsc::unbounded_channel();
-    let sink = PrintSink { finished: finished_tx };
+    let broker = klets_lib::permissions::PermissionBroker::new();
+    let sink = PrintSink {
+        finished: finished_tx,
+        broker: broker.clone(),
+        approve: std::env::var("KLETS_APPROVE")
+            .map(|raw| raw.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_default(),
+    };
 
-    let worker = std::thread::spawn(move || run_agent_thread(sink, plan, rx));
+    let worker = std::thread::spawn(move || run_agent_thread(sink, plan, broker, rx));
 
     tx.send(AgentCommand::Prompt { turn: 1, text: prompt })
         .expect("send prompt");

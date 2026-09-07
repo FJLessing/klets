@@ -1,9 +1,23 @@
 <script lang="ts" setup>
 import { computed, ref } from "vue";
 import MarkdownView from "@/components/app/MarkdownView.vue";
-import { MessageRole, type ChatMessage } from "@/helpers/types";
+import { IpcService } from "@/services/ipc";
+import { MessageRole, type ChatMessage, type PendingPermission } from "@/helpers/types";
 
 const props = defineProps<{ message: ChatMessage; }>();
+
+async function respond(request: PendingPermission, allow: boolean) {
+	// Mark it locally so the buttons cannot be pressed twice; the core also
+	// emits a resolved event, which sets the same field.
+	request.outcome = allow ? "allowed" : "denied";
+	await IpcService.respondPermission(request.id, allow);
+}
+
+function outcomeLabel(request: PendingPermission): string {
+	if (request.outcome === "allowed") return "Allowed";
+	if (request.outcome === "timedOut") return "No answer — refused";
+	return "Denied";
+}
 
 const showThoughts = ref(false);
 
@@ -48,6 +62,28 @@ const displaySource = computed(() =>
 			</button>
 			<div v-if="hasThoughts && showThoughts" class="message__thoughts">
 				{{ message.thoughts }}
+			</div>
+
+			<div
+				v-for="request in message.permissions"
+				:key="request.id"
+				class="permission"
+				:class="{ 'permission--answered': !!request.outcome }"
+			>
+				<div class="permission__body">
+					<span class="permission__title">{{ request.title }}</span>
+					<code v-if="request.detail" class="permission__detail">{{ request.detail }}</code>
+				</div>
+
+				<div v-if="!request.outcome" class="permission__actions">
+					<button type="button" class="permission__deny" @click="respond(request, false)">
+						Deny
+					</button>
+					<button type="button" class="permission__allow" @click="respond(request, true)">
+						Allow
+					</button>
+				</div>
+				<span v-else class="permission__outcome">{{ outcomeLabel(request) }}</span>
 			</div>
 
 			<div v-if="isThinking" class="message__thinking" aria-label="Thinking">
@@ -136,6 +172,79 @@ const displaySource = computed(() =>
 	background: var(--surface-raised);
 	border-radius: 0.5rem;
 	white-space: pre-wrap;
+}
+
+.permission {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.75rem;
+	margin: 0 0 0.6rem;
+	padding: 0.5rem 0.6rem 0.5rem 0.7rem;
+	background: var(--surface-raised);
+	border: 0.0625rem solid var(--accent);
+	border-radius: 0.5rem;
+}
+
+.permission--answered {
+	border-color: var(--border);
+}
+
+.permission__body {
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 0.25rem;
+}
+
+.permission__title {
+	font-size: 0.82rem;
+	color: var(--text);
+}
+
+.permission__detail {
+	font-family: var(--font-mono);
+	font-size: 0.75rem;
+	color: var(--text-muted);
+	overflow-wrap: anywhere;
+}
+
+.permission__actions {
+	flex: none;
+	display: flex;
+	gap: 0.35rem;
+}
+
+.permission__allow,
+.permission__deny {
+	padding: 0.25rem 0.65rem;
+	font-family: inherit;
+	font-size: 0.78rem;
+	border-radius: 0.35rem;
+	border: 0.0625rem solid var(--border-strong);
+	background: none;
+	color: var(--text-muted);
+	cursor: pointer;
+}
+
+.permission__allow {
+	color: var(--text);
+	border-color: var(--accent);
+}
+
+.permission__allow:hover {
+	background: var(--surface-hover);
+}
+
+.permission__deny:hover {
+	color: var(--danger);
+	border-color: var(--danger);
+}
+
+.permission__outcome {
+	flex: none;
+	font-size: 0.75rem;
+	color: var(--text-faint);
 }
 
 .message__thinking {

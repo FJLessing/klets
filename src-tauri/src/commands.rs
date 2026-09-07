@@ -16,13 +16,21 @@ pub struct AppSnapshot {
     pub providers: Vec<ProviderStatus>,
     pub agent_event: &'static str,
     pub active_provider: Option<String>,
+    /// The seed prompt, so "reset to default" never has to duplicate it.
+    pub default_system_prompt: &'static str,
 }
 
 fn provider_statuses(settings: &Settings) -> Vec<ProviderStatus> {
     providers::PROVIDERS
         .iter()
         .map(|spec| {
-            let has_api_key = settings::has_api_key(spec.key_id);
+            let keys = providers::SavedKeys {
+                api_key: settings::has_api_key(spec.key_id),
+                subscription_token: spec
+                    .subscription_key_id
+                    .is_some_and(settings::has_api_key),
+            };
+            let auth_mode = settings.auth_mode_for(spec);
             ProviderStatus {
                 id: spec.id.to_string(),
                 name: spec.name.to_string(),
@@ -35,8 +43,13 @@ fn provider_statuses(settings: &Settings) -> Vec<ProviderStatus> {
                 default_model: spec.default_model.map(str::to_string),
                 binary_path: providers::resolve_binary(spec.command)
                     .map(|p| p.to_string_lossy().to_string()),
-                has_api_key,
-                authenticated: spec.is_authenticated(has_api_key),
+                has_api_key: keys.api_key,
+                has_subscription_token: keys.subscription_token,
+                authenticated: spec.is_authenticated(auth_mode, &keys),
+                auth_mode,
+                auth_modes: spec.auth_modes.to_vec(),
+                subscription_key_id: spec.subscription_key_id.map(str::to_string),
+                runs_via: spec.runs_via.map(str::to_string),
                 model: settings.model_for(spec),
             }
         })
@@ -91,6 +104,7 @@ pub fn get_snapshot(app: AppHandle, agent: State<'_, AgentManager>) -> AppSnapsh
         settings,
         agent_event: AGENT_EVENT,
         active_provider: agent.active_provider(),
+        default_system_prompt: settings::DEFAULT_SYSTEM_PROMPT,
     }
 }
 
@@ -119,6 +133,7 @@ pub fn save_settings(
         settings,
         agent_event: AGENT_EVENT,
         active_provider: None,
+        default_system_prompt: settings::DEFAULT_SYSTEM_PROMPT,
     })
 }
 
@@ -131,6 +146,44 @@ pub fn set_api_key(app: AppHandle, key_id: String, value: String) -> AppResult<A
         settings,
         agent_event: AGENT_EVENT,
         active_provider: None,
+        default_system_prompt: settings::DEFAULT_SYSTEM_PROMPT,
+    })
+}
+
+/// Switch a provider between its own login and a Klets-supplied API key.
+#[tauri::command]
+pub fn set_auth_mode(
+    app: AppHandle,
+    agent: State<'_, AgentManager>,
+    provider_id: String,
+    mode: settings::AuthMode,
+) -> AppResult<AppSnapshot> {
+    let spec = providers::find(&provider_id)
+        .ok_or_else(|| AppError::UnknownProvider(provider_id.clone()))?;
+
+    if !spec.auth_modes.contains(&mode) {
+        return Err(AppError::Config(format!(
+            "{} does not support that sign-in method",
+            spec.name
+        )));
+    }
+
+    let mut settings = settings::load(&app);
+    let mut provider = settings.provider(&provider_id);
+    provider.auth_mode = Some(mode);
+    settings.providers.insert(provider_id, provider);
+    settings::save(&app, &settings)?;
+
+    // The running agent was launched with the old credentials.
+    agent.stop();
+
+    let providers = provider_statuses(&settings);
+    Ok(AppSnapshot {
+        providers,
+        settings,
+        agent_event: AGENT_EVENT,
+        active_provider: None,
+        default_system_prompt: settings::DEFAULT_SYSTEM_PROMPT,
     })
 }
 
@@ -165,6 +218,45 @@ pub fn cancel_turn(agent: State<'_, AgentManager>) {
     agent.cancel();
 }
 
+/// Answer a pending tool request.
+#[tauri::command]
+pub fn respond_permission(agent: State<'_, AgentManager>, id: u64, allow: bool) {
+    agent.broker().resolve(id, allow);
+}
+
+/// Choose the folder agents run in. An empty value restores the scratch
+/// directory, which is the safe default.
+#[tauri::command]
+pub fn set_working_dir(
+    app: AppHandle,
+    agent: State<'_, AgentManager>,
+    path: Option<String>,
+) -> AppResult<AppSnapshot> {
+    let cleaned = path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+
+    if let Some(dir) = cleaned.as_ref() {
+        if !std::path::Path::new(dir).is_dir() {
+            return Err(AppError::Config(format!("'{dir}' is not a folder")));
+        }
+    }
+
+    let mut settings = settings::load(&app);
+    settings.working_dir = cleaned;
+    settings::save(&app, &settings)?;
+
+    // The running agent is rooted in the old directory.
+    agent.stop();
+
+    let providers = provider_statuses(&settings);
+    Ok(AppSnapshot {
+        providers,
+        settings,
+        agent_event: AGENT_EVENT,
+        active_provider: None,
+        default_system_prompt: settings::DEFAULT_SYSTEM_PROMPT,
+    })
+}
+
 #[tauri::command]
 pub fn new_chat(agent: State<'_, AgentManager>) -> u64 {
     agent.new_session()
@@ -187,22 +279,36 @@ pub fn close_settings(app: AppHandle) {
     }
 }
 
+/// Smallest and largest launcher heights, in logical pixels. Both include the
+/// transparent gutter the frontend leaves around the card for its shadow.
+const MIN_LAUNCHER_HEIGHT: f64 = 96.0;
+const MAX_LAUNCHER_HEIGHT: f64 = 700.0;
+
 /// Resize the launcher to fit its content, within the configured bounds.
+///
+/// Only the height ever changes, and it is applied in physical pixels while the
+/// existing width is passed through untouched. Converting the width to logical
+/// units and back does not round-trip cleanly under fractional DPI scaling, so
+/// doing that on every streamed token made the window twitch horizontally.
 #[tauri::command]
 pub fn resize_launcher(app: AppHandle, height: f64) {
     let Some(window) = windows::launcher(&app) else {
         return;
     };
-    let Ok(size) = window.inner_size() else {
-        return;
-    };
-    let Ok(scale) = window.scale_factor() else {
+    let (Ok(size), Ok(scale)) = (window.outer_size(), window.scale_factor()) else {
         return;
     };
 
-    let width = size.width as f64 / scale;
-    let height = height.clamp(72.0, 620.0);
-    let _ = window.set_size(tauri::LogicalSize::new(width, height));
+    let clamped = height.clamp(MIN_LAUNCHER_HEIGHT, MAX_LAUNCHER_HEIGHT);
+    let target = (clamped * scale).round() as u32;
+
+    // Skip no-op resizes; the frontend measures far more often than the size
+    // actually changes.
+    if target == size.height {
+        return;
+    }
+
+    let _ = window.set_size(tauri::PhysicalSize::new(size.width, target));
 }
 
 #[tauri::command]

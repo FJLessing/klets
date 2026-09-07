@@ -1,7 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import type { AgentEvent, AppSnapshot, Settings } from "@/helpers/types";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import type { AgentEvent, AppSnapshot, AuthMode, Settings } from "@/helpers/types";
 
 /**
  * Single entry point to the Rust core.
@@ -22,6 +23,10 @@ export class IpcService {
 		return invoke<AppSnapshot>("set_api_key", { keyId, value });
 	}
 
+	static async setAuthMode(providerId: string, mode: AuthMode): Promise<AppSnapshot> {
+		return invoke<AppSnapshot>("set_auth_mode", { providerId, mode });
+	}
+
 	static async setActiveProvider(providerId: string): Promise<void> {
 		return invoke("set_active_provider", { providerId });
 	}
@@ -32,6 +37,24 @@ export class IpcService {
 
 	static async cancelTurn(): Promise<void> {
 		return invoke("cancel_turn");
+	}
+
+	static async respondPermission(id: number, allow: boolean): Promise<void> {
+		return invoke("respond_permission", { id, allow });
+	}
+
+	static async setWorkingDir(path: string | null): Promise<AppSnapshot> {
+		return invoke<AppSnapshot>("set_working_dir", { path });
+	}
+
+	/** Native folder picker; resolves to null if the user cancels. */
+	static async pickFolder(defaultPath?: string | null): Promise<string | null> {
+		const selection = await openDialog({
+			directory: true,
+			multiple: false,
+			defaultPath: defaultPath ?? undefined,
+		});
+		return typeof selection === "string" ? selection : null;
 	}
 
 	static async newChat(): Promise<number> {
