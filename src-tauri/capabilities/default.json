@@ -1,0 +1,29 @@
+{
+	"$schema": "https://schema.tauri.app/config/2/schema",
+	"identifier": "default",
+	"description": "Capability for Klets windows",
+	"windows": ["main", "settings"],
+	"permissions": [
+		"core:default",
+		"core:window:allow-show",
+		"core:window:allow-hide",
+		"core:window:allow-close",
+		"core:window:allow-set-focus",
+		"core:window:allow-set-always-on-top",
+		"core:window:allow-set-size",
+		"core:window:allow-set-position",
+		"core:window:allow-center",
+		"core:window:allow-start-dragging",
+		"core:window:allow-set-ignore-cursor-events",
+		"core:webview:allow-create-webview-window",
+		"core:event:allow-listen",
+		"core:event:allow-emit",
+		"core:event:allow-emit-to",
+		"core:event:allow-unlisten",
+		"core:app:allow-version",
+		"opener:allow-open-url",
+		"store:default",
+		"autostart:default",
+		"global-shortcut:default"
+	]
+}

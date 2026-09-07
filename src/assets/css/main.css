@@ -1,0 +1,111 @@
+@import "highlight.js/styles/github-dark.css";
+
+:root {
+	--surface: rgba(24, 24, 29, 0.92);
+	--surface-app: #17171b;
+	--surface-raised: rgba(255, 255, 255, 0.045);
+	--surface-hover: rgba(255, 255, 255, 0.08);
+	--surface-code: rgba(0, 0, 0, 0.32);
+
+	--border: rgba(255, 255, 255, 0.09);
+	--border-strong: rgba(255, 255, 255, 0.16);
+
+	--text: #ececf1;
+	--text-muted: #a9a9b6;
+	--text-faint: #74747f;
+
+	--accent: #6c5ce7;
+	--accent-text: #a29bfe;
+	--success: #4ec9a5;
+	--danger: #ff7a7a;
+	--danger-surface: rgba(255, 122, 122, 0.1);
+
+	--font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+	--font-mono: "Cascadia Code", "JetBrains Mono", ui-monospace, "SF Mono", Consolas, monospace;
+
+	color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+	:root {
+		--surface: rgba(252, 252, 253, 0.94);
+		--surface-app: #f6f6f8;
+		--surface-raised: rgba(0, 0, 0, 0.035);
+		--surface-hover: rgba(0, 0, 0, 0.06);
+		--surface-code: rgba(0, 0, 0, 0.05);
+
+		--border: rgba(0, 0, 0, 0.09);
+		--border-strong: rgba(0, 0, 0, 0.16);
+
+		--text: #1d1d21;
+		--text-muted: #5b5b66;
+		--text-faint: #8b8b96;
+
+		--accent: #5b4bd6;
+		--accent-text: #5b4bd6;
+		--success: #1f9d76;
+		--danger: #d2413f;
+		--danger-surface: rgba(210, 65, 63, 0.08);
+
+		color-scheme: light;
+	}
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+	margin: 0;
+	padding: 0;
+	height: 100%;
+}
+
+body {
+	font-family: var(--font-sans);
+	background: transparent;
+	color: var(--text);
+	-webkit-font-smoothing: antialiased;
+	overflow: hidden;
+	/* The launcher is a floating panel, not a document. */
+	user-select: none;
+	cursor: default;
+}
+
+input,
+textarea,
+.markdown {
+	user-select: text;
+}
+
+/* The launcher card animates itself in; the OS window appears instantly. */
+#app {
+	animation: klets-in 0.16s ease-out;
+}
+
+@keyframes klets-in {
+	from {
+		opacity: 0;
+		transform: translateY(-0.4rem) scale(0.99);
+	}
+	to {
+		opacity: 1;
+		transform: none;
+	}
+}
+
+::-webkit-scrollbar {
+	width: 0.5rem;
+	height: 0.5rem;
+}
+
+::-webkit-scrollbar-thumb {
+	background: var(--border-strong);
+	border-radius: 1rem;
+}
+
+::-webkit-scrollbar-track {
+	background: transparent;
+}
