@@ -12,6 +12,7 @@ vi.mock("@/services/ipc", () => ({
 		sendPrompt: vi.fn().mockResolvedValue(1),
 		cancelTurn: vi.fn().mockResolvedValue(undefined),
 		newChat: vi.fn().mockResolvedValue(2),
+		warmAgent: vi.fn().mockResolvedValue(undefined),
 		errorMessage: (error: unknown) =>
 			typeof error === "string" ? error : error instanceof Error ? error.message : "Something went wrong",
 	},
@@ -24,6 +25,7 @@ beforeEach(() => {
 	vi.mocked(IpcService.sendPrompt).mockReset().mockResolvedValue(1);
 	vi.mocked(IpcService.cancelTurn).mockReset().mockResolvedValue(undefined);
 	vi.mocked(IpcService.newChat).mockReset().mockResolvedValue(2);
+	vi.mocked(IpcService.warmAgent).mockReset().mockResolvedValue(undefined);
 });
 
 describe("chatstore: sending a prompt", () => {
@@ -138,6 +140,9 @@ describe("chatstore: streaming events", () => {
 
 		expect(store.isStreaming).toBe(false);
 		expect(store.currentMessage?.error).toBe("The agent stopped unexpectedly");
+		// The bubble already shows it; a duplicate standalone banner would be
+		// redundant and confusing.
+		expect(store.idleError).toBeNull();
 	});
 
 	it("records discovered commands without touching the transcript", async () => {
@@ -163,6 +168,99 @@ describe("chatstore: streaming events", () => {
 		expect(store.currentMessage?.notices).toEqual([
 			"Refused Write config.json — Klets does not allow edit operations.",
 		]);
+	});
+});
+
+describe("chatstore: idle failures (warm-up, most commonly)", () => {
+	it("surfaces a Stopped failure with no active turn as idleError", () => {
+		const store = useChatStore();
+
+		store.handleEvent({
+			type: "status",
+			provider: "claude",
+			state: AgentState.Stopped,
+			detail: "claude-agent-acp is not on PATH",
+		});
+
+		expect(store.idleError).toBe("claude-agent-acp is not on PATH");
+		// There is no bubble to attach it to, since nothing was streaming.
+		expect(store.messages).toHaveLength(0);
+	});
+
+	it("does not surface a clean stop (no detail) as an error", () => {
+		const store = useChatStore();
+
+		store.handleEvent({ type: "status", provider: "claude", state: AgentState.Stopped });
+
+		expect(store.idleError).toBeNull();
+	});
+
+	it("clears a stale idleError once a fresh connection attempt starts", () => {
+		const store = useChatStore();
+		store.handleEvent({
+			type: "status",
+			provider: "claude",
+			state: AgentState.Stopped,
+			detail: "boom",
+		});
+		expect(store.idleError).toBe("boom");
+
+		store.handleEvent({ type: "status", provider: "claude", state: AgentState.Starting });
+
+		expect(store.idleError).toBeNull();
+	});
+
+	it("warm() succeeds silently when the core accepts it", async () => {
+		const store = useChatStore();
+		await store.warm();
+		expect(IpcService.warmAgent).toHaveBeenCalledOnce();
+		expect(store.idleError).toBeNull();
+	});
+
+	it("warm() records a rejection as an idleError", async () => {
+		vi.mocked(IpcService.warmAgent).mockRejectedValueOnce(new Error("no provider configured"));
+		const store = useChatStore();
+
+		await store.warm();
+
+		expect(store.agentState).toBe(AgentState.Stopped);
+		expect(store.idleError).toBe("no provider configured");
+	});
+});
+
+describe("chatstore: hasPendingPermission", () => {
+	async function seedTurn(store: ReturnType<typeof useChatStore>) {
+		await store.send("run the tests");
+	}
+
+	it("is false with no messages", () => {
+		const store = useChatStore();
+		expect(store.hasPendingPermission).toBe(false);
+	});
+
+	it("is true while a permission request has no outcome yet", async () => {
+		const store = useChatStore();
+		await seedTurn(store);
+		store.handleEvent({
+			type: "permissionRequest",
+			turn: 1,
+			request: { id: 1, title: "Run: rm -rf build", kind: "execute", detail: null },
+		});
+
+		expect(store.hasPendingPermission).toBe(true);
+	});
+
+	it("is false once the permission has been resolved", async () => {
+		const store = useChatStore();
+		await seedTurn(store);
+		store.handleEvent({
+			type: "permissionRequest",
+			turn: 1,
+			request: { id: 1, title: "Run: rm -rf build", kind: "execute", detail: null },
+		});
+		store.handleEvent({ type: "permissionResolved", turn: 1, id: 1, allowed: true, timedOut: false });
+
+		expect(store.hasPendingPermission).toBe(false);
 	});
 });
 

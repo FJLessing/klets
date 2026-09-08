@@ -76,7 +76,9 @@ body {
 
 input,
 textarea,
-.markdown {
+.markdown,
+code,
+.provider__path {
 	user-select: text;
 }
 

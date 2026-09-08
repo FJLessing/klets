@@ -22,6 +22,7 @@
 		"core:event:allow-unlisten",
 		"core:app:allow-version",
 		"opener:allow-open-url",
+		"opener:allow-default-urls",
 		"dialog:allow-open",
 		"store:default",
 		"autostart:default",

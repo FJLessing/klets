@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import ChatMessageItem from "@/components/app/ChatMessageItem.vue";
+import { shouldResetAfterHide } from "@/helpers/idle";
 import { IpcService } from "@/services/ipc";
 import { useChatStore } from "@/stores/chatstore";
 import { useSettingsStore } from "@/stores/settingsstore";
@@ -16,6 +17,8 @@ const transcript = ref<HTMLElement | null>(null);
 const draft = ref("");
 const showProviders = ref(false);
 const showCommands = ref(false);
+/** When the launcher was last hidden, for the reset-after-N-minutes check. */
+const hiddenAt = ref<number | null>(null);
 
 const unlisteners: UnlistenFn[] = [];
 
@@ -177,6 +180,10 @@ async function pickProvider(id: string) {
 	showProviders.value = false;
 	if (id === settingsStore.settings?.activeProvider) return;
 	await settingsStore.selectProvider(id);
+	// Get the new provider connecting immediately rather than waiting for
+	// the next prompt — also what stops `reset()` below from handing its
+	// "fresh session" request to the old provider's still-running agent.
+	void chatStore.warm();
 	// A different agent means a different conversation.
 	await chatStore.reset();
 	focusInput();
@@ -203,7 +210,26 @@ onMounted(async () => {
 		await IpcService.onFocus(async () => {
 			// Re-detect agents: one may have been installed or signed in since.
 			await settingsStore.load();
+
+			if (
+				shouldResetAfterHide(
+					settingsStore.settings?.resetWhenHidden ?? false,
+					hiddenAt.value,
+					Date.now(),
+					chatStore.hasPendingPermission,
+				)
+			) {
+				await newChat();
+			}
+			hiddenAt.value = null;
+
+			// Get the agent connecting again rather than waiting for the
+			// first prompt — a no-op if it's already up.
+			void chatStore.warm();
 			focusInput();
+		}),
+		await IpcService.onHidden(() => {
+			hiddenAt.value = Date.now();
 		}),
 	);
 });
@@ -342,6 +368,15 @@ watch([showProviders, showCommands], syncWindowHeight);
 
 			<div v-if="chatStore.statusLabel" class="launcher__status">
 				{{ chatStore.statusLabel }}
+			</div>
+
+			<!--
+				A warm-up (or other idle) failure has no turn bubble to attach
+				to, so it gets its own row. Self-clears once a fresh connection
+				attempt starts (see chatstore's `status` handling).
+			-->
+			<div v-else-if="chatStore.idleError" class="launcher__status launcher__status--error">
+				{{ chatStore.idleError }}
 			</div>
 
 			<div v-if="!chatStore.isEmpty" ref="transcript" class="launcher__transcript">
@@ -557,6 +592,10 @@ watch([showProviders, showCommands], syncWindowHeight);
 	padding: 0 0.9rem 0.7rem 2.75rem;
 	font-size: 0.78rem;
 	color: var(--text-faint);
+}
+
+.launcher__status--error {
+	color: var(--danger);
 }
 
 .launcher__transcript {

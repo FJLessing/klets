@@ -11,16 +11,28 @@ const html = computed(() => renderMarkdown(props.source));
 /**
  * Links and copy buttons are inside rendered HTML, so they are handled with a
  * single delegated listener rather than per-node Vue bindings.
+ *
+ * Every `<a>` is matched, not just `[data-external]`: a webview must never
+ * navigate away from the app shell (see the comment in markdown.ts), and a
+ * relative or `mailto:` link has nowhere else useful to go, so it is simply
+ * swallowed rather than left to the default in-app navigation.
  */
 async function onClick(event: MouseEvent) {
-	const target = (event.target as HTMLElement | null)?.closest("[data-external], [data-copy]");
+	const target = (event.target as HTMLElement | null)?.closest("a, [data-copy]");
 	if (!target) return;
 
 	event.preventDefault();
 
 	const href = target.getAttribute("data-external");
 	if (href) {
-		await IpcService.openExternal(href);
+		try {
+			await IpcService.openExternal(href);
+		} catch (err) {
+			// Not user-actionable (no default browser, OS-level failure, or a
+			// permission scope regression) — surfaced for debugging rather
+			// than silently swallowed, since preventDefault already ran.
+			console.error(`Klets: could not open ${href} in the system browser`, err);
+		}
 		return;
 	}
 

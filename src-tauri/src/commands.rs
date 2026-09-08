@@ -108,6 +108,22 @@ pub fn get_snapshot(app: AppHandle, agent: State<'_, AgentManager>) -> AppSnapsh
     }
 }
 
+/// Whether a settings change could invalidate the running agent — anything
+/// baked into its `LaunchPlan` at spawn time (`agent::LaunchPlan::build`):
+/// the active provider, a provider's model or auth mode, the tool policy, the
+/// system prompt (written as an instruction file before the handshake), or
+/// the working directory (the process's cwd).
+///
+/// Cosmetic fields — the hotkey, launch-at-login, hide-on-blur, reset-on-hide
+/// — must not kill a warmed-up connection just because Settings was saved.
+fn agent_relevant_change(previous: &Settings, next: &Settings) -> bool {
+    previous.active_provider != next.active_provider
+        || previous.providers != next.providers
+        || previous.tool_policy != next.tool_policy
+        || previous.system_prompt != next.system_prompt
+        || previous.working_dir != next.working_dir
+}
+
 #[tauri::command]
 pub fn save_settings(
     app: AppHandle,
@@ -125,8 +141,9 @@ pub fn save_settings(
         shortcuts::set_autostart(&app, settings.launch_at_login)?;
     }
 
-    // A model or provider change means the running agent no longer matches.
-    agent.stop();
+    if agent_relevant_change(&previous, &settings) {
+        agent.stop();
+    }
 
     Ok(AppSnapshot {
         providers: provider_statuses(&settings),
@@ -262,6 +279,21 @@ pub fn new_chat(agent: State<'_, AgentManager>) -> u64 {
     agent.new_session()
 }
 
+/// Get the active provider's process and ACP handshake started ahead of the
+/// first prompt, so "Connecting…" is already behind us by the time the user
+/// asks something.
+///
+/// Best-effort in spirit: a real prompt still starts the agent itself if this
+/// was never called or failed, since `AgentManager::prompt` warms internally
+/// too. The error is still propagated rather than swallowed here so a caller
+/// that wants to show it (a missing binary, most commonly) can.
+#[tauri::command]
+pub fn warm_agent(app: AppHandle, agent: State<'_, AgentManager>) -> AppResult<()> {
+    let settings = settings::load(&app);
+    let provider_id = settings.active_provider.clone();
+    agent.warm(&app, &settings, &provider_id)
+}
+
 #[tauri::command]
 pub fn hide_launcher(app: AppHandle) {
     windows::hide_launcher(&app);
@@ -315,4 +347,51 @@ pub fn resize_launcher(app: AppHandle, height: f64) {
 pub fn quit(app: AppHandle, agent: State<'_, AgentManager>) {
     agent.stop();
     app.exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permissions::ToolPolicy;
+    use crate::settings::ProviderSettings;
+
+    #[test]
+    fn agent_relevant_change_is_false_for_purely_cosmetic_edits() {
+        let previous = Settings::default();
+        let mut next = previous.clone();
+        next.hotkey = "Alt+Space".to_string();
+        next.hide_on_blur = false;
+        next.launch_at_login = true;
+        next.reset_when_hidden = false;
+
+        assert!(!agent_relevant_change(&previous, &next), "none of these touch the LaunchPlan");
+    }
+
+    #[test]
+    fn agent_relevant_change_is_true_for_each_field_baked_into_the_launch_plan() {
+        let previous = Settings::default();
+
+        let mut provider_changed = previous.clone();
+        provider_changed.active_provider = "codex".to_string();
+        assert!(agent_relevant_change(&previous, &provider_changed), "active_provider");
+
+        let mut model_changed = previous.clone();
+        model_changed.providers.insert(
+            "claude".to_string(),
+            ProviderSettings { enabled: true, model: Some("opus".to_string()), auth_mode: None },
+        );
+        assert!(agent_relevant_change(&previous, &model_changed), "providers");
+
+        let mut policy_changed = previous.clone();
+        policy_changed.tool_policy = ToolPolicy::ReadOnly;
+        assert!(agent_relevant_change(&previous, &policy_changed), "tool_policy");
+
+        let mut prompt_changed = previous.clone();
+        prompt_changed.system_prompt = "Be terse.".to_string();
+        assert!(agent_relevant_change(&previous, &prompt_changed), "system_prompt");
+
+        let mut dir_changed = previous.clone();
+        dir_changed.working_dir = Some("/tmp".to_string());
+        assert!(agent_relevant_change(&previous, &dir_changed), "working_dir");
+    }
 }

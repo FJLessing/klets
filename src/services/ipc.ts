@@ -61,6 +61,12 @@ export class IpcService {
 		return invoke<number>("new_chat");
 	}
 
+	/** Best-effort: get the active provider's process and handshake started
+	 * ahead of the first prompt. */
+	static async warmAgent(): Promise<void> {
+		return invoke("warm_agent");
+	}
+
 	static async hideLauncher(): Promise<void> {
 		return invoke("hide_launcher");
 	}
@@ -87,6 +93,10 @@ export class IpcService {
 
 	static onFocus(handler: () => void): Promise<UnlistenFn> {
 		return listen("klets://focus", () => handler());
+	}
+
+	static onHidden(handler: () => void): Promise<UnlistenFn> {
+		return listen("klets://hidden", () => handler());
 	}
 
 	/** Open a link in the user's browser rather than inside the launcher. */

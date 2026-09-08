@@ -1,7 +1,7 @@
 {
   "name": "klets",
   "private": true,
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Spotlight-style quick answers from ACP coding agents",
   "repository": {
     "type": "git",

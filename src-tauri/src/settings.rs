@@ -25,7 +25,7 @@ pub enum AuthMode {
     ApiKey,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProviderSettings {
     pub enabled: bool,
@@ -58,6 +58,9 @@ pub struct Settings {
     pub system_prompt: String,
     /// Directory agents run in. Empty means the managed scratch directory.
     pub working_dir: Option<String>,
+    /// Clear the conversation once the launcher has been hidden for a while,
+    /// so re-summoning it after a long gap never resumes a stale exchange.
+    pub reset_when_hidden: bool,
 }
 
 impl Default for Settings {
@@ -71,6 +74,7 @@ impl Default for Settings {
             tool_policy: ToolPolicy::default(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             working_dir: None,
+            reset_when_hidden: true,
         }
     }
 }
@@ -253,6 +257,7 @@ mod tests {
         assert_eq!(settings.tool_policy, ToolPolicy::AskToRun);
         assert_eq!(settings.system_prompt, DEFAULT_SYSTEM_PROMPT);
         assert_eq!(settings.working_dir, None);
+        assert!(settings.reset_when_hidden);
     }
 
     #[test]

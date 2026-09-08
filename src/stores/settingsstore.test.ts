@@ -23,6 +23,7 @@ function makeSettings(overrides: Partial<Settings> = {}): Settings {
 		toolPolicy: ToolPolicy.AskToRun,
 		systemPrompt: "default prompt",
 		workingDir: null,
+		resetWhenHidden: true,
 		...overrides,
 	};
 }

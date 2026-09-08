@@ -23,9 +23,15 @@ pub fn show_launcher(app: &AppHandle) {
     let _ = app.emit_to(LAUNCHER, "klets://focus", ());
 }
 
+/// Hide the launcher and tell the frontend it happened.
+///
+/// The single choke point for every hide path (Esc, blur, the tray menu,
+/// closing the window) — mirroring `show_launcher`'s `klets://focus` — so the
+/// frontend can time how long it's been in the background regardless of why.
 pub fn hide_launcher(app: &AppHandle) {
     if let Some(window) = launcher(app) {
         let _ = window.hide();
+        let _ = app.emit_to(LAUNCHER, "klets://hidden", ());
     }
 }
 

@@ -16,6 +16,10 @@ use agent::AgentManager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // First thing, while this is still the only thread: see the doc comment.
+    #[cfg(target_os = "macos")]
+    providers::inherit_login_shell_path();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -47,6 +51,7 @@ pub fn run() {
             commands::respond_permission,
             commands::set_working_dir,
             commands::new_chat,
+            commands::warm_agent,
             commands::hide_launcher,
             commands::open_settings,
             commands::close_settings,
@@ -54,6 +59,13 @@ pub fn run() {
             commands::quit,
         ])
         .setup(|app| {
+            // `skipTaskbar` is unsupported on macOS; the equivalent of a
+            // tray-only launcher there is an Accessory app, which has no Dock
+            // icon and stays out of Cmd+Tab while still able to show and focus
+            // its windows.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             let handle = app.handle().clone();
             let stored = settings::load(&handle);
 
@@ -94,16 +106,24 @@ pub fn run() {
 
             match event {
                 // The launcher is a transient surface: dismiss it instead of
-                // closing, and let the settings window hide too.
+                // closing, and let the settings window hide too. Both go
+                // through `windows::hide_launcher` for the launcher itself so
+                // every path that hides it emits `klets://hidden` — the
+                // single choke point `klets://focus` already has on the show
+                // side.
                 WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
-                    let _ = window.hide();
+                    if window.label() == windows::LAUNCHER {
+                        windows::hide_launcher(app);
+                    } else {
+                        let _ = window.hide();
+                    }
                 }
                 WindowEvent::Focused(false)
                     if window.label() == windows::LAUNCHER
                         && settings::load(app).hide_on_blur =>
                 {
-                    let _ = window.hide();
+                    windows::hide_launcher(app);
                 }
                 _ => {}
             }

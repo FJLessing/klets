@@ -17,8 +17,9 @@ already have installed (Claude Code, Codex, gemini-cli, or OpenCode) and
 speaks ACP — JSON-RPC 2.0 over stdio — to it, the same protocol Zed and
 JetBrains use. Whatever that agent is signed in to is what answers.
 
-Stack: Tauri 2 (Rust core) + Vue 3 + TypeScript (frontend), built and tested
-on Windows only. Single developer, no CI yet.
+Stack: Tauri 2 (Rust core) + Vue 3 + TypeScript (frontend). Developed on
+Windows; builds, tests, and runs against a real agent on macOS (arm64) as
+well, though macOS has had far less use. Single developer, no CI yet.
 
 ## Directory map
 
@@ -133,6 +134,37 @@ match (Windows can't `CreateProcess` a PowerShell script directly), which is
 exactly what `providers::tests::find_on_path_picks_the_cmd_shim_over_a_same_named_ps1`
 locks in.
 
+**macOS has three things Windows never needed.** (1) A Finder/Dock-launched
+app inherits launchd's minimal `PATH`, not the shell's, so every agent binary
+would resolve as "not installed" and npm shims would fail on `#!/usr/bin/env
+node`. `providers::inherit_login_shell_path` asks `$SHELL -ilc` for the real
+PATH and rewrites the process's own, first thing in `run()` while it is still
+single-threaded (env mutation is not thread-safe on Unix). (2) `keyring` needs
+the `apple-native` feature; without it, it silently uses an in-memory mock
+that reports every save as successful and forgets it. (3) `skipTaskbar` is
+unsupported, so `lib.rs` sets `ActivationPolicy::Accessory` (no Dock icon, no
+Cmd+Tab entry) and `transparent: true` needs `macOSPrivateApi` plus the
+`macos-private-api` Cargo feature or the launcher renders as an opaque box.
+
+**Linux needs the same keyring treatment, just a different feature.**
+`Cargo.toml` also enables `linux-native-sync-persistent` (Secret Service —
+GNOME Keyring/KWallet — falling back to the kernel keyring when no Secret
+Service is running) and `crypto-rust` (so the Linux build doesn't need
+libssl-dev). The Linux-only dependencies these pull in are gated on
+`target_os = "linux"` inside the `keyring` crate itself, so they add nothing
+to the macOS or Windows binary — confirmed by `cargo build` on macOS only
+adding them to `Cargo.lock`, never compiling them.
+
+**Claude Code's macOS credentials are in the Keychain, and Klets now checks
+for them without ever reading the secret.** `providers::keychain_item_exists`
+shells out to `/usr/bin/security find-generic-password -s <service>` and
+looks only at the exit status — deliberately never passing `-w`, which would
+read the stored secret and trigger the OS's "klets wants to access..."
+prompt for a value Klets never needed. `ProviderSpec::credential_keychain_services`
+is declarative data like everything else in the registry (empty for every
+provider except Claude), checked in `is_authenticated` alongside
+`credential_paths`, and a no-op returning `false` on non-macOS targets.
+
 **Window resize is done in physical pixels, on purpose.** `resize_launcher`
 converts height only, in physical pixels, and passes the existing width
 through untouched. Converting width to logical units and back does not
@@ -194,7 +226,7 @@ regardless of which agent or tool made the change.
 ```bash
 npm install                          # once
 npm run tauri dev                    # run the app
-npm run tauri build                  # release build + NSIS installer (Windows)
+npm run tauri build                  # release build: NSIS/MSI on Windows, .app/.dmg on macOS
 
 cd src-tauri && cargo test           # Rust unit tests (fast, no agent needed)
 cd src-tauri && cargo clippy --all-targets
@@ -276,11 +308,19 @@ traffic while debugging an adapter itself rather than Klets' handling of it.
 - No CI configured.
 - No frontend component/DOM tests (Vitest tests are store- and helper-level
   logic only, run in a Node environment — no `jsdom`, no rendering).
-- macOS/Linux are architecturally supported by Tauri but have never been
-  built or run; assume Windows-only behavior until proven otherwise (path
-  separators, `.cmd` shims, and `CREATE_NO_WINDOW` are all Windows-specific
-  code already gated behind `#[cfg(windows)]`, so check for the equivalent gap
-  on other platforms before assuming parity).
+- Linux has never been built or run; the `keyring` Secret Service feature and
+  the declarative provider registry should carry over cleanly (nothing in
+  `providers.rs` is macOS/Windows-specific data), but PATH inheritance under
+  a Linux desktop launcher, the global hotkey, and tray behavior are all
+  unverified. macOS builds, passes all tests, and completes real agent turns
+  via `acp_probe` and the bundled `.app`, but the GUI has had comparatively
+  little hands-on use there. Known macOS rough edges, not yet addressed: the
+  default `Ctrl+Space` hotkey is Control+Space (collides with the
+  input-source switcher if more than one keyboard layout is enabled); the
+  tray icon is not a monochrome template image; the launcher does not join
+  all Spaces, so it won't appear over a full-screen app; `Cmd+Q` bypasses
+  `WindowEvent::CloseRequested`, so `AgentManager::stop` is not called on
+  that path.
 - Single active session per provider; no persisted conversation history.
 - MCP servers are **discovered**, not configured — Klets shows whatever an
   agent already reports (`AgentEvent::Capabilities`, driven by ACP's

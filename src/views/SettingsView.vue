@@ -10,6 +10,8 @@ const keyDrafts = reactive<Record<string, string>>({});
 const modelDrafts = reactive<Record<string, string>>({});
 const capturingHotkey = ref(false);
 const promptDraft = ref("");
+/** Which install/login hint was just copied, for transient button feedback. */
+const copiedHint = ref<string | null>(null);
 
 const TOOL_POLICIES: Array<{ value: ToolPolicy; label: string; description: string }> = [
 	{ value: ToolPolicy.Off, label: "Off", description: "Answers come from the model alone." },
@@ -82,6 +84,15 @@ function needsKeyField(provider: ProviderStatus): boolean {
 	return provider.authMode === AuthMode.ApiKey;
 }
 
+/** Copies an install/login hint and briefly flips its button to "Copied". */
+async function copyHint(key: string, text: string) {
+	await navigator.clipboard.writeText(text);
+	copiedHint.value = key;
+	window.setTimeout(() => {
+		if (copiedHint.value === key) copiedHint.value = null;
+	}, 1400);
+}
+
 async function saveKey(provider: ProviderStatus) {
 	const value = keyDrafts[provider.keyId] ?? "";
 	await settingsStore.saveApiKey(provider.keyId, value);
@@ -115,7 +126,7 @@ function onHotkeyKeydown(event: KeyboardEvent) {
 	settingsStore.save({ hotkey: parts.join("+") });
 }
 
-async function toggle(field: "hideOnBlur" | "launchAtLogin", value: boolean) {
+async function toggle(field: "hideOnBlur" | "launchAtLogin" | "resetWhenHidden", value: boolean) {
 	await settingsStore.save({ [field]: value });
 }
 </script>
@@ -175,6 +186,21 @@ async function toggle(field: "hideOnBlur" | "launchAtLogin", value: boolean) {
 					class="settings__checkbox"
 					:checked="settingsStore.settings?.launchAtLogin"
 					@change="toggle('launchAtLogin', ($event.target as HTMLInputElement).checked)"
+				/>
+			</div>
+
+			<div class="settings__row settings__row--last">
+				<div>
+					<span class="settings__label">Clear the conversation after 20 minutes hidden</span>
+					<span class="settings__help">
+						Re-summoning it after a long gap starts fresh instead of resuming a stale exchange.
+					</span>
+				</div>
+				<input
+					type="checkbox"
+					class="settings__checkbox"
+					:checked="settingsStore.settings?.resetWhenHidden"
+					@change="toggle('resetWhenHidden', ($event.target as HTMLInputElement).checked)"
 				/>
 			</div>
 		</section>
@@ -282,10 +308,19 @@ async function toggle(field: "hideOnBlur" | "launchAtLogin", value: boolean) {
 					</span>
 				</header>
 
-				<p v-if="!provider.binaryPath" class="provider__install">
-					Install the agent, then reopen this window:
-					<code class="provider__code">{{ provider.installHint }}</code>
-				</p>
+				<template v-if="!provider.binaryPath">
+					<p class="provider__install">Install the agent, then reopen this window:</p>
+					<div class="provider__code-row">
+						<code class="provider__code">{{ provider.installHint }}</code>
+						<button
+							type="button"
+							class="provider__copy"
+							@click="copyHint(`${provider.id}-install`, provider.installHint)"
+						>
+							{{ copiedHint === `${provider.id}-install` ? "Copied" : "Copy" }}
+						</button>
+					</div>
+				</template>
 				<template v-else>
 					<p class="provider__path">
 						{{ provider.binaryPath }}
@@ -308,13 +343,19 @@ async function toggle(field: "hideOnBlur" | "launchAtLogin", value: boolean) {
 						</button>
 					</div>
 
-					<p
-						v-if="!provider.authenticated && provider.authMode === AuthMode.Subscription"
-						class="provider__install"
-					>
-						Sign in from a terminal:
-						<code class="provider__code">{{ provider.loginHint }}</code>
-					</p>
+					<template v-if="!provider.authenticated && provider.authMode === AuthMode.Subscription">
+						<p class="provider__install">Sign in from a terminal:</p>
+						<div class="provider__code-row">
+							<code class="provider__code">{{ provider.loginHint }}</code>
+							<button
+								type="button"
+								class="provider__copy"
+								@click="copyHint(`${provider.id}-login`, provider.loginHint)"
+							>
+								{{ copiedHint === `${provider.id}-login` ? "Copied" : "Copy" }}
+							</button>
+						</div>
+					</template>
 				</template>
 
 				<div v-if="provider.binaryPath && needsKeyField(provider)" class="provider__field">
@@ -591,14 +632,21 @@ async function toggle(field: "hideOnBlur" | "launchAtLogin", value: boolean) {
 }
 
 .provider__install {
-	margin: 0 0 0.7rem;
+	margin: 0 0 0.35rem;
 	font-size: 0.8rem;
 	color: var(--text-muted);
 }
 
+.provider__code-row {
+	display: flex;
+	align-items: flex-start;
+	gap: 0.4rem;
+	margin: 0 0 0.7rem;
+}
+
 .provider__code {
-	display: block;
-	margin-top: 0.35rem;
+	flex: 1;
+	min-width: 0;
 	padding: 0.4rem 0.55rem;
 	font-family: var(--font-mono);
 	font-size: 0.76rem;
@@ -606,6 +654,23 @@ async function toggle(field: "hideOnBlur" | "launchAtLogin", value: boolean) {
 	background: var(--surface-code);
 	border-radius: 0.4rem;
 	overflow-wrap: anywhere;
+}
+
+.provider__copy {
+	flex-shrink: 0;
+	padding: 0.3rem 0.55rem;
+	font-family: inherit;
+	font-size: 0.72rem;
+	color: var(--text-muted);
+	background: var(--surface-hover);
+	border: 0.0625rem solid var(--border-strong);
+	border-radius: 0.35rem;
+	cursor: pointer;
+	transition: color 0.15s ease;
+}
+
+.provider__copy:hover {
+	color: var(--text);
 }
 
 .provider__path {

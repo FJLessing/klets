@@ -74,6 +74,7 @@ export interface Settings {
 	toolPolicy: ToolPolicy;
 	systemPrompt: string;
 	workingDir: string | null;
+	resetWhenHidden: boolean;
 }
 
 export interface AppSnapshot {

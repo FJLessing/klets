@@ -272,6 +272,19 @@ impl AgentManager {
         Ok(())
     }
 
+    /// Start the agent for `provider_id` ahead of the first prompt, so the
+    /// process spawn and ACP handshake are already done by the time the user
+    /// asks something.
+    ///
+    /// A thin public name over `ensure` so callers that only want to warm up
+    /// — not send anything — don't have to reach for `prompt`. Free thanks to
+    /// `ensure`'s own idempotence: calling this repeatedly (every time the
+    /// launcher is shown, say) is a no-op once a matching agent is already
+    /// running or already warming up.
+    pub fn warm(&self, app: &AppHandle, settings: &Settings, provider_id: &str) -> AppResult<()> {
+        self.ensure(app, settings, provider_id)
+    }
+
     /// Send a prompt, starting the agent if needed. Returns the turn id.
     pub fn prompt(
         &self,

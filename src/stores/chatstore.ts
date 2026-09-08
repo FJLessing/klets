@@ -14,6 +14,12 @@ interface ChatState {
 	commands: AgentCommandInfo[];
 	agentState: AgentState;
 	agentDetail: string | null;
+	/**
+	 * A `Stopped` failure that happened with no turn to attach it to — most
+	 * commonly a pre-connect warm-up. There is no bubble for this, so unlike
+	 * an ordinary turn error it needs its own place to render.
+	 */
+	idleError: string | null;
 	activeTurn: number | null;
 	isSending: boolean;
 	error: string | null;
@@ -40,6 +46,7 @@ export const useChatStore = defineStore("chat", {
 		commands: [],
 		agentState: AgentState.Stopped,
 		agentDetail: null,
+		idleError: null,
 		activeTurn: null,
 		isSending: false,
 		error: null,
@@ -65,6 +72,10 @@ export const useChatStore = defineStore("chat", {
 			if (this.agentState === AgentState.Connecting) return "Connecting…";
 			return null;
 		},
+		/** Whether the current bubble has an Allow/Deny decision still open. */
+		hasPendingPermission(): boolean {
+			return this.currentMessage?.permissions.some((p) => !p.outcome) ?? false;
+		},
 	},
 	actions: {
 		async send(text: string) {
@@ -73,6 +84,7 @@ export const useChatStore = defineStore("chat", {
 
 			this.isSending = true;
 			this.error = null;
+			this.idleError = null;
 
 			this.messages.push({
 				id: this.nextId++,
@@ -110,11 +122,28 @@ export const useChatStore = defineStore("chat", {
 			}
 		},
 
+		/**
+		 * Best-effort: start the agent ahead of the first prompt. A failure
+		 * (a missing binary, most commonly) lands in `idleError` — the same
+		 * place a handshake failure during a real turn would put it, since
+		 * from the frontend's perspective both are "the agent tried to start
+		 * and couldn't", just with no turn number attached.
+		 */
+		async warm() {
+			try {
+				await IpcService.warmAgent();
+			} catch (err) {
+				this.agentState = AgentState.Stopped;
+				this.idleError = IpcService.errorMessage(err);
+			}
+		},
+
 		async reset() {
 			if (this.isStreaming) await this.cancel();
 			this.messages = [];
 			this.activeTurn = null;
 			this.error = null;
+			this.idleError = null;
 			// A new chat may run on a different agent, so its list of tools
 			// from the last one is no longer accurate.
 			this.commands = [];
@@ -128,10 +157,18 @@ export const useChatStore = defineStore("chat", {
 		/** Fold one streamed event into the transcript. */
 		handleEvent(event: AgentEvent) {
 			if (event.type === "status") {
+				const wasStreaming = this.isStreaming;
 				this.agentState = event.state;
 				this.agentDetail = event.detail ?? null;
-				if (event.state === AgentState.Stopped && this.isStreaming) {
+
+				if (event.state !== AgentState.Stopped) {
+					// A fresh attempt is underway; an earlier idle failure no
+					// longer describes what's happening.
+					this.idleError = null;
+				} else if (wasStreaming) {
 					this.finishTurn(event.detail ?? "The agent stopped unexpectedly");
+				} else if (event.detail) {
+					this.idleError = event.detail;
 				}
 				return;
 			}

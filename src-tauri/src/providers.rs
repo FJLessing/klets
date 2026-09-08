@@ -36,6 +36,11 @@ pub struct ProviderSpec {
     /// Credential files written by the agent's own login flow, relative to the
     /// home directory. Their presence means the CLI can authenticate itself.
     pub credential_paths: &'static [&'static str],
+    /// macOS Keychain service names the agent's own CLI writes when signed
+    /// in, checked alongside `credential_paths`. Some agents (Claude Code)
+    /// store their session in the Keychain instead of a file on macOS, so
+    /// `credential_paths` alone would under-report them as signed out there.
+    pub credential_keychain_services: &'static [&'static str],
     /// Supported auth modes, most preferred first.
     pub auth_modes: &'static [AuthMode],
     /// Env var carrying a long-lived subscription token, where the agent
@@ -76,6 +81,9 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         default_model: None,
         login_hint: "claude auth login",
         credential_paths: &[".claude/.credentials.json"],
+        // Confirmed empirically: on macOS Claude Code writes its OAuth
+        // session to this Keychain item, not to `.claude/.credentials.json`.
+        credential_keychain_services: &["Claude Code-credentials"],
         auth_modes: &[AuthMode::Subscription, AuthMode::ApiKey],
         // `claude setup-token` mints a long-lived token for a subscription.
         subscription_env_var: Some("CLAUDE_CODE_OAUTH_TOKEN"),
@@ -97,6 +105,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         default_model: None,
         login_hint: "codex login",
         credential_paths: &[".codex/auth.json"],
+        credential_keychain_services: &[],
         auth_modes: &[AuthMode::Subscription, AuthMode::ApiKey],
         subscription_env_var: None,
         subscription_key_id: None,
@@ -121,6 +130,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         default_model: Some("gemini-3.7-flash"),
         login_hint: "paste a Gemini API key below",
         credential_paths: &[],
+        credential_keychain_services: &[],
         auth_modes: &[AuthMode::ApiKey],
         subscription_env_var: None,
         subscription_key_id: None,
@@ -141,6 +151,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         default_model: Some("opencode-go/kimi-k3"),
         login_hint: "opencode auth login",
         credential_paths: &[".local/share/opencode/auth.json", ".config/opencode/auth.json"],
+        credential_keychain_services: &[],
         auth_modes: &[AuthMode::Subscription, AuthMode::ApiKey],
         subscription_env_var: None,
         subscription_key_id: None,
@@ -161,6 +172,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         default_model: Some("opencode/big-pickle"),
         login_hint: "opencode auth login",
         credential_paths: &[".local/share/opencode/auth.json", ".config/opencode/auth.json"],
+        credential_keychain_services: &[],
         auth_modes: &[AuthMode::Subscription, AuthMode::ApiKey],
         subscription_env_var: None,
         subscription_key_id: None,
@@ -222,11 +234,16 @@ impl ProviderSpec {
                 if self.subscription_env_var.is_some_and(env_var_set) {
                     return true;
                 }
-                home_dir().is_some_and(|home| {
+                if home_dir().is_some_and(|home| {
                     self.credential_paths
                         .iter()
                         .any(|relative| home.join(relative).exists())
-                })
+                }) {
+                    return true;
+                }
+                self.credential_keychain_services
+                    .iter()
+                    .any(|service| keychain_item_exists(service))
             }
         }
     }
@@ -247,6 +264,29 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
+}
+
+/// Whether a Keychain item named `service` exists, without ever reading its
+/// secret.
+///
+/// Shelling out to `security` and deliberately never passing `-w` means this
+/// only asks the Keychain for a yes/no on existence — reading another app's
+/// secret would trigger the OS's "klets wants to access..." prompt, which
+/// would be both alarming and pointless, since Klets never uses the value.
+#[cfg(target_os = "macos")]
+fn keychain_item_exists(service: &str) -> bool {
+    std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", service])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_item_exists(_service: &str) -> bool {
+    false
 }
 
 /// Resolve a command against PATH, honouring Windows executable extensions.
@@ -317,6 +357,63 @@ fn executable_extensions() -> Vec<String> {
     vec![String::new()]
 }
 
+/// Replace this process's PATH with the one the user's login shell would have.
+///
+/// A macOS app launched from Finder, the Dock, or Spotlight inherits launchd's
+/// minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), not the user's shell PATH.
+/// Every agent Klets can spawn lives elsewhere — Homebrew, npm, bun, or a
+/// `~/.local/bin` installer — so without this, [`resolve_binary`] reports every
+/// provider missing, and even an absolute path to an npm shim would fail
+/// because `#!/usr/bin/env node` cannot find `node` in the child's environment.
+/// Rewriting PATH once fixes both, since children inherit it.
+///
+/// Must run before any other thread exists: mutating the environment is not
+/// thread-safe on Unix. Under `tauri dev` from a terminal this is a no-op in
+/// effect, because the shell PATH is already inherited.
+#[cfg(target_os = "macos")]
+pub fn inherit_login_shell_path() {
+    const MARKER: &str = "__KLETS_PATH__";
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    // `-i` as well as `-l`, because plenty of people set PATH only in .zshrc.
+    // The markers make the answer robust to whatever else an interactive shell
+    // prints on startup.
+    let output = std::process::Command::new(&shell)
+        .args(["-ilc", &format!("printf '{MARKER}%s{MARKER}' \"$PATH\"")])
+        .stdin(std::process::Stdio::null())
+        .output();
+    let Ok(output) = output else { return };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(login_path) = extract_between_markers(&stdout, MARKER) else { return };
+    let current = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", merge_paths(login_path, &current));
+}
+
+/// Pull the shell's PATH out from between two occurrences of `marker`.
+///
+/// Free function so the parsing survives a shell that prints a greeting or a
+/// warning around the answer, and is testable without spawning one.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn extract_between_markers<'a>(output: &'a str, marker: &str) -> Option<&'a str> {
+    let start = output.find(marker)? + marker.len();
+    let end = output[start..].find(marker)? + start;
+    let value = output[start..end].trim();
+    (!value.is_empty()).then_some(value)
+}
+
+/// The login shell's PATH first, then anything the process already had that
+/// the shell didn't mention, deduplicated in order. Keeping the current
+/// entries means an unusual launch environment can only gain directories.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn merge_paths(preferred: &str, current: &str) -> String {
+    let mut seen = Vec::new();
+    for dir in preferred.split(':').chain(current.split(':')) {
+        if !dir.is_empty() && !seen.contains(&dir) {
+            seen.push(dir);
+        }
+    }
+    seen.join(":")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +434,7 @@ mod tests {
         default_model: None,
         login_hint: "",
         credential_paths: &[],
+        credential_keychain_services: &[],
         auth_modes: &[AuthMode::Subscription, AuthMode::ApiKey],
         subscription_env_var: None,
         subscription_key_id: None,
@@ -423,6 +521,51 @@ mod tests {
     }
 
     #[test]
+    fn find_on_path_resolves_a_bare_name_with_the_unix_extension_list() {
+        // The non-Windows branch of `executable_extensions` is just the empty
+        // string; make sure that actually finds an extension-less binary.
+        let dir = TempDir::new("bare-name");
+        let binary = dir.touch("opencode");
+
+        let found = find_on_path("opencode", std::iter::once(dir.0.clone()), &[String::new()])
+            .expect("bare name should resolve");
+
+        assert_eq!(found, binary);
+    }
+
+    // --- login-shell PATH ----------------------------------------------------
+
+    #[test]
+    fn extract_between_markers_ignores_shell_noise_around_the_answer() {
+        let output = "Welcome back!\n__M__/opt/homebrew/bin:/usr/bin__M__\nbye\n";
+        assert_eq!(
+            extract_between_markers(output, "__M__"),
+            Some("/opt/homebrew/bin:/usr/bin"),
+        );
+    }
+
+    #[test]
+    fn extract_between_markers_needs_both_markers_and_a_value() {
+        assert_eq!(extract_between_markers("__M__/usr/bin", "__M__"), None);
+        assert_eq!(extract_between_markers("__M____M__", "__M__"), None);
+        assert_eq!(extract_between_markers("no markers here", "__M__"), None);
+    }
+
+    #[test]
+    fn merge_paths_prefers_the_login_shell_and_keeps_unique_extras() {
+        let merged = merge_paths(
+            "/opt/homebrew/bin:/usr/bin:/bin",
+            "/usr/bin:/bin:/usr/sbin:/sbin",
+        );
+        assert_eq!(merged, "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+    }
+
+    #[test]
+    fn merge_paths_drops_empty_entries() {
+        assert_eq!(merge_paths("/a::/b", ""), "/a:/b");
+    }
+
+    #[test]
     fn resolve_binary_absolute_path_checks_existence_directly() {
         let dir = TempDir::new("absolute");
         let file = dir.touch("exists.exe");
@@ -481,5 +624,43 @@ mod tests {
         // settings toggle for it would be a dead end.
         let gemini = find("gemini").expect("gemini is registered");
         assert_eq!(gemini.auth_modes, &[AuthMode::ApiKey]);
+    }
+
+    #[test]
+    fn claude_lists_its_macos_keychain_credential_service() {
+        // Claude Code stores its OAuth session in the macOS Keychain rather
+        // than `~/.claude/.credentials.json`; without this, `is_authenticated`
+        // would permanently under-report a signed-in Claude there.
+        let claude = find("claude").expect("claude is registered");
+        assert_eq!(claude.credential_keychain_services, &["Claude Code-credentials"]);
+    }
+
+    #[test]
+    fn only_claude_declares_a_keychain_credential_service() {
+        // Every other provider's CLI writes a plain credential file. A stray
+        // entry here would be silent dead data, since nothing else checks it.
+        for spec in PROVIDERS.iter().filter(|p| p.id != "claude") {
+            assert!(
+                spec.credential_keychain_services.is_empty(),
+                "provider '{}' should not declare a keychain service",
+                spec.id,
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn keychain_item_exists_is_false_for_an_unused_service_name() {
+        assert!(!keychain_item_exists("klets-test-definitely-not-a-real-service-9f3a1"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn is_authenticated_checks_keychain_services_when_nothing_else_matches() {
+        const SPEC: ProviderSpec = ProviderSpec {
+            credential_keychain_services: &["klets-test-definitely-not-a-real-service-9f3a1"],
+            ..TEST_SPEC
+        };
+        assert!(!SPEC.is_authenticated(AuthMode::Subscription, &SavedKeys::default()));
     }
 }
