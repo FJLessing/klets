@@ -13,7 +13,8 @@ quick-answer box that happens to be able to let an agent read real files and
 run commands, gated by an explicit permission policy.
 
 Klets does not talk to any model API directly. It spawns an agent binary you
-already have installed (Claude Code, Codex, gemini-cli, or OpenCode) and
+already have installed (Claude Code, Codex, gemini-cli, OpenCode, or Google
+Antigravity's `agy_acp_server`) and
 speaks ACP — JSON-RPC 2.0 over stdio — to it, the same protocol Zed and
 JetBrains use. Whatever that agent is signed in to is what answers.
 

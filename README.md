@@ -12,7 +12,7 @@ no editor to open, no context to lose.
 
 Klets doesn't run its own model or call any API directly. It spawns whichever
 coding agent you already have installed and signed in to — **Claude Code,
-Codex, Gemini, or OpenCode** — and speaks
+Codex, Gemini, OpenCode, or Antigravity** — and speaks
 [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC 2.0 over
 stdio) to it, the same protocol Zed and JetBrains use. Whatever subscription
 or API key already authenticates that agent is what answers — Klets adds no
@@ -25,8 +25,8 @@ billing of its own.
 - **No editor to open.** A global hotkey opens a floating bar over whatever
   you're doing; answering closes it again.
 - **Uses your existing agent, not a new subscription.** Claude Code, Codex,
-  Gemini, or OpenCode — whichever you already run, however it's already
-  authenticated (subscription login or an API key).
+  Gemini, OpenCode, or Google Antigravity — whichever you already run,
+  however it's already authenticated (subscription login or an API key).
 - **Reads real files and runs commands, with a policy you control.** Off,
   read-only, or ask-before-running — see [Tools](#tools) below. Edits are
   always refused.
@@ -44,9 +44,28 @@ billing of its own.
 | Gemini | `gemini --acp` | `npm i -g @google/gemini-cli` |
 | OpenCode Go | `opencode acp` | `curl -fsSL https://opencode.ai/install \| bash` |
 | OpenCode Zen | `opencode acp` | same binary as Go |
+| Antigravity | `agy_acp_server` | manual: see below |
 
 OpenCode Go and Zen are one binary told apart by model id — `opencode-go/…`
 versus `opencode/…` — which Klets sets per session.
+
+**Antigravity has no package-manager install.** `agy_acp_server` is Google
+Antigravity's ACP adapter — a separate binary from the interactive `agy` TUI,
+which has no ACP mode at all. It's distributed as a per-platform zip (fetched
+by Zed's own extension installer, or directly from
+`dl.google.com/agy-extensions/releases/...`), not published for `npm install
+-g` or similar. Download the archive for your platform and put both
+`agy_acp_server` and its required `localharness_external` sidecar in one
+folder on `PATH` — Klets only resolves the first, but the server fails
+immediately without the second sitting next to it.
+
+Antigravity prefers your existing Google/Antigravity sign-in: if
+`~/.gemini/oauth_creds.json` exists (written by Antigravity IDE, `agy`, or
+gemini-cli's own login — they share the same "Gemini home"), Klets ensures
+`~/.gemini/antigravity-acp/settings.json` says so and never touches that file
+if a real install already owns it. With no existing sign-in, it falls back to
+a Gemini API key, injected through an isolated, Klets-owned `$GEMINI_HOME` so
+the fallback path never reads or writes your real `~/.gemini`.
 
 **Gemini needs an auth override.** gemini-cli stores its sign-in method in
 `~/.gemini/settings.json`, and the default `oauth-personal` authenticates

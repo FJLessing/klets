@@ -102,16 +102,38 @@ impl LaunchPlan {
             }
         }
 
-        // gemini-cli pins its sign-in method in a settings file with no CLI
-        // override, so Klets points it at a private one for this process only.
-        if mode == AuthMode::ApiKey {
-            if let Some(providers::AuthSettingsOverride::GeminiCli) = spec.auth_settings_override {
+        match spec.auth_settings_override {
+            // gemini-cli pins its sign-in method in a settings file with no
+            // CLI override, so Klets points it at a private one for this
+            // process only.
+            Some(providers::AuthSettingsOverride::GeminiCli) if mode == AuthMode::ApiKey => {
                 let path = write_gemini_settings(app)?;
                 env.push((
                     "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
                     path.to_string_lossy().to_string(),
                 ));
             }
+            // agy_acp_server ties its settings file and its OAuth cache to the
+            // same $GEMINI_HOME root — there is no settings-only override
+            // like gemini-cli's — so the two auth modes need opposite
+            // strategies. See `AuthSettingsOverride::AntigravityAcp`.
+            Some(providers::AuthSettingsOverride::AntigravityAcp) => match mode {
+                AuthMode::ApiKey => {
+                    let home = write_antigravity_api_key_settings(app)?;
+                    env.push(("GEMINI_HOME".to_string(), home.to_string_lossy().to_string()));
+                }
+                AuthMode::Subscription => {
+                    // Leave $GEMINI_HOME untouched so the real, shared
+                    // ~/.gemini/oauth_creds.json — written by the user's own
+                    // Antigravity IDE/CLI sign-in, not by Klets — stays
+                    // visible. Confirmed empirically: a present credential
+                    // file with no settings file still reads as fully
+                    // unauthenticated, so one has to exist; never overwrite
+                    // a real one.
+                    ensure_antigravity_subscription_settings()?;
+                }
+            },
+            _ => {}
         }
 
         let mut args: Vec<String> = spec.args.iter().map(|a| a.to_string()).collect();
@@ -200,6 +222,117 @@ fn write_gemini_settings(app: &AppHandle) -> AppResult<PathBuf> {
 
     std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
     Ok(path)
+}
+
+/// Write a private settings file that forces agy_acp_server onto API-key
+/// auth, inside an isolated `$GEMINI_HOME` Klets owns for this purpose.
+///
+/// Unlike gemini-cli, agy_acp_server resolves its settings file and its
+/// OAuth credential cache from the same `$GEMINI_HOME` root, so there is no
+/// way to override just the settings file the way [`write_gemini_settings`]
+/// does. Pointing `$GEMINI_HOME` at a directory Klets owns keeps this mode
+/// from ever reading or writing the user's real `~/.gemini`.
+///
+/// Returns the `$GEMINI_HOME` value to set, not the settings file path
+/// itself.
+fn write_antigravity_api_key_settings(app: &AppHandle) -> AppResult<PathBuf> {
+    let home = settings::managed_dir(app)?.join("antigravity-home");
+    let dir = home.join("antigravity-acp");
+    std::fs::create_dir_all(&dir)?;
+
+    let config = serde_json::json!({ "auth": { "type": "gemini-api-key" } });
+    std::fs::write(dir.join("settings.json"), serde_json::to_string_pretty(&config)?)?;
+
+    Ok(home)
+}
+
+/// Make sure agy_acp_server can resolve to oauth-personal on its own,
+/// without redirecting `$GEMINI_HOME` away from the user's real
+/// `~/.gemini` — that would hide the shared `oauth_creds.json` an existing
+/// Antigravity IDE or CLI sign-in already wrote there.
+///
+fn ensure_antigravity_subscription_settings() -> AppResult<()> {
+    let Some(home) = providers::home_dir() else {
+        return Ok(());
+    };
+    ensure_antigravity_subscription_settings_at(&home)
+}
+
+/// The testable half of [`ensure_antigravity_subscription_settings`], taking
+/// the home directory as a parameter instead of reading it from the
+/// environment — mirrors the split in `providers::resolve_binary` /
+/// `find_on_path`, for the same reason: real `HOME`/`USERPROFILE` isn't safe
+/// to rewrite from a test.
+///
+/// Never overwrites an existing file: a real Antigravity install may already
+/// own this path with its own `gcp.project`/`gcp.location` configuration.
+fn ensure_antigravity_subscription_settings_at(home: &Path) -> AppResult<()> {
+    let dir = home.join(".gemini").join("antigravity-acp");
+    let path = dir.join("settings.json");
+    if path.exists() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&dir)?;
+    let config = serde_json::json!({ "auth": { "type": "oauth-personal" } });
+    std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A temp directory unique to the test process, cleaned up on drop —
+    /// same pattern `providers::tests` uses for the same reason: these tests
+    /// touch the real filesystem and must not collide under parallel runs.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("klets-agent-test-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn writes_oauth_personal_when_no_settings_file_exists_yet() {
+        let home = TempDir::new("missing");
+
+        ensure_antigravity_subscription_settings_at(&home.0).expect("writes settings");
+
+        let path = home.0.join(".gemini").join("antigravity-acp").join("settings.json");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read settings")).expect("valid json");
+        assert_eq!(written["auth"]["type"], "oauth-personal");
+    }
+
+    #[test]
+    fn never_overwrites_a_real_settings_file() {
+        // A real Antigravity IDE/CLI install may already own this path with
+        // its own auth type and gcp project/location — Klets must never
+        // clobber it, even if that means occasionally leaving a mismatched
+        // config in place rather than "fixing" it silently.
+        let home = TempDir::new("existing");
+        let dir = home.0.join(".gemini").join("antigravity-acp");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("settings.json");
+        let real_config = r#"{"auth":{"type":"oauth-business"},"gcp":{"project":"real-project"}}"#;
+        std::fs::write(&path, real_config).expect("seed real settings");
+
+        ensure_antigravity_subscription_settings_at(&home.0).expect("no-op on existing file");
+
+        let untouched = std::fs::read_to_string(&path).expect("read settings");
+        assert_eq!(untouched, real_config);
+    }
 }
 
 /// Handle to the running agent thread.

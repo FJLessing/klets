@@ -65,6 +65,17 @@ pub enum AuthSettingsOverride {
     /// no flag to change it. Klets writes a private settings file and points
     /// the process at it, leaving the user's own config untouched.
     GeminiCli,
+    /// agy_acp_server (Google Antigravity's ACP adapter) resolves both its own
+    /// settings file and its OAuth credential cache from the same
+    /// `$GEMINI_HOME` root, so there is no way to override just the settings
+    /// file the way `GeminiCli` does — confirmed empirically by probing the
+    /// real binary. The two auth modes therefore need opposite strategies:
+    /// API-key mode gets an isolated, Klets-owned `$GEMINI_HOME` so it never
+    /// touches the user's real Antigravity/gemini-cli state; subscription
+    /// mode leaves `$GEMINI_HOME` untouched so the shared, real
+    /// `~/.gemini/oauth_creds.json` — written by the user's own sign-in, not
+    /// by Klets — stays visible. See `agent.rs`'s handling of this variant.
+    AntigravityAcp,
 }
 
 pub const PROVIDERS: &[ProviderSpec] = &[
@@ -180,6 +191,38 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         model_flag: None,
         auth_settings_override: None,
     },
+    // agy_acp_server is Google Antigravity's ACP adapter — a separate binary
+    // from the interactive `agy` TUI, which has no ACP mode at all. It shares
+    // its OAuth credential cache with gemini-cli under `~/.gemini`, since both
+    // resolve the same "Gemini home", but keeps its own settings file at
+    // `~/.gemini/antigravity-acp/settings.json`, so it needs its own
+    // auth-settings override rather than reusing gemini-cli's. Confirmed by
+    // probing the real binary: model selection goes through
+    // `session/set_config_option` like OpenCode, and tool calls raise a
+    // normal `session/request_permission`. There is no package-manager
+    // install — the binary and its required `localharness_external` sidecar
+    // are only distributed as a per-platform zip.
+    ProviderSpec {
+        id: "antigravity",
+        name: "Antigravity",
+        command: "agy_acp_server",
+        args: &[],
+        key_id: "antigravity",
+        key_label: "Gemini API key (fallback when no Antigravity/Google sign-in is found)",
+        env_var: "GEMINI_API_KEY",
+        install_hint: "No package-manager install: download the platform archive from https://antigravity.google/download (or the matching dl.google.com/agy-extensions/releases zip) and put both agy_acp_server and localharness_external in one folder on PATH — the harness binary is required alongside the server binary.",
+        key_url: "https://aistudio.google.com/apikey",
+        default_model: Some("gemini-3.7-flash-high"),
+        login_hint: "sign in to Google Antigravity (IDE or CLI) with your Google account, or paste a Gemini API key below",
+        credential_paths: &[".gemini/oauth_creds.json"],
+        credential_keychain_services: &[],
+        auth_modes: &[AuthMode::Subscription, AuthMode::ApiKey],
+        subscription_env_var: None,
+        subscription_key_id: None,
+        runs_via: None,
+        model_flag: None,
+        auth_settings_override: Some(AuthSettingsOverride::AntigravityAcp),
+    },
 ];
 
 pub fn find(id: &str) -> Option<&'static ProviderSpec> {
@@ -260,7 +303,7 @@ fn env_var_set(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
 }
 
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
@@ -610,6 +653,7 @@ mod tests {
             ("gemini", AuthMode::ApiKey),
             ("opencode-go", AuthMode::Subscription),
             ("opencode-zen", AuthMode::Subscription),
+            ("antigravity", AuthMode::Subscription),
         ];
 
         for (id, mode) in expected {
@@ -624,6 +668,32 @@ mod tests {
         // settings toggle for it would be a dead end.
         let gemini = find("gemini").expect("gemini is registered");
         assert_eq!(gemini.auth_modes, &[AuthMode::ApiKey]);
+    }
+
+    #[test]
+    fn antigravity_falls_back_to_api_key_after_subscription() {
+        // Unlike Gemini (API-key only), Antigravity can reuse an existing
+        // Google/Antigravity sign-in — subscription must be tried first.
+        let antigravity = find("antigravity").expect("antigravity is registered");
+        assert_eq!(antigravity.auth_modes, &[AuthMode::Subscription, AuthMode::ApiKey]);
+    }
+
+    #[test]
+    fn antigravity_detects_the_shared_gemini_oauth_credential_file() {
+        // agy_acp_server shares its OAuth cache with gemini-cli under the
+        // same "Gemini home" — confirmed by probing the real binary — so
+        // this is the file whose presence signals a subscription is usable.
+        let antigravity = find("antigravity").expect("antigravity is registered");
+        assert_eq!(antigravity.credential_paths, &[".gemini/oauth_creds.json"]);
+    }
+
+    #[test]
+    fn antigravity_declares_its_mode_aware_auth_override() {
+        let antigravity = find("antigravity").expect("antigravity is registered");
+        assert_eq!(
+            antigravity.auth_settings_override,
+            Some(AuthSettingsOverride::AntigravityAcp),
+        );
     }
 
     #[test]
