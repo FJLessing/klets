@@ -79,6 +79,7 @@ pub fn run() {
             }
 
             build_tray(&handle)?;
+            shortcuts::sync_autostart(&handle, stored.launch_at_login);
 
             // Only interrupt with settings when nothing can answer a question:
             // an agent counts as usable if it is installed and can sign in,
