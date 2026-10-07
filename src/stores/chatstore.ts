@@ -21,6 +21,8 @@ interface ChatState {
 	 */
 	idleError: string | null;
 	activeTurn: number | null;
+	/** Highest turn id the core has handed out, prompts and new chats alike. */
+	lastTurn: number;
 	isSending: boolean;
 	error: string | null;
 	nextId: number;
@@ -48,6 +50,7 @@ export const useChatStore = defineStore("chat", {
 		agentDetail: null,
 		idleError: null,
 		activeTurn: null,
+		lastTurn: 0,
 		isSending: false,
 		error: null,
 		nextId: 1,
@@ -101,7 +104,9 @@ export const useChatStore = defineStore("chat", {
 			this.messages.push(pending);
 
 			try {
-				this.activeTurn = await IpcService.sendPrompt(trimmed);
+				const turn = await IpcService.sendPrompt(trimmed);
+				this.activeTurn = turn;
+				this.recordTurn(turn);
 			} catch (err) {
 				const message = IpcService.errorMessage(err);
 				pending.error = message;
@@ -148,7 +153,7 @@ export const useChatStore = defineStore("chat", {
 			// from the last one is no longer accurate.
 			this.commands = [];
 			try {
-				await IpcService.newChat();
+				this.recordTurn(await IpcService.newChat());
 			} catch (err) {
 				this.error = IpcService.errorMessage(err);
 			}
@@ -218,6 +223,10 @@ export const useChatStore = defineStore("chat", {
 			// that has already been closed off.
 			if (!message.streaming) return;
 
+			// A new chat's `done` can land after the next question was asked
+			// (gemini's session/new takes seconds) and would close its bubble.
+			if (!this.isCurrentTurn(event.turn)) return;
+
 			switch (event.type) {
 				case "chunk":
 					message.text += event.text;
@@ -253,6 +262,21 @@ export const useChatStore = defineStore("chat", {
 					this.finishTurn(event.message);
 					break;
 			}
+		},
+
+		recordTurn(turn: number) {
+			this.lastTurn = Math.max(this.lastTurn, turn);
+		},
+
+		/**
+		 * Turn 0 is connection-level and applies to whatever is in flight.
+		 * While `sendPrompt` is still pending the new id is unknown, but any
+		 * id not yet handed out can only be it.
+		 */
+		isCurrentTurn(turn: number): boolean {
+			if (turn === 0) return true;
+			if (this.activeTurn !== null) return turn === this.activeTurn;
+			return turn > this.lastTurn;
 		},
 
 		finishTurn(error: string | null) {

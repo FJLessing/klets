@@ -8,6 +8,7 @@
 //! ```text
 //! cargo run --example acp_probe -- opencode acp -- "What is 2+2?"
 //! cargo run --example acp_probe -- gemini --experimental-acp -- "Say hi"
+//! KLETS_NEW_SESSION=1 cargo run --example acp_probe -- opencode acp   # New chat, then ask
 //! ```
 
 use std::sync::mpsc as std_mpsc;
@@ -20,6 +21,8 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 struct PrintSink {
     finished: std_mpsc::Sender<()>,
+    /// The prompt's turn; only its Done/Error ends the probe.
+    prompt_turn: u64,
     /// Answers approval prompts the way the UI would.
     broker: klets_lib::permissions::PermissionBroker,
     /// Tool kinds to approve, from KLETS_APPROVE.
@@ -64,13 +67,17 @@ impl EventSink for PrintSink {
                 }
             }
             AgentEvent::Notice { message, .. } => println!("\n[notice] {message}"),
-            AgentEvent::Done { stop_reason, .. } => {
-                println!("\n[done] {}", stop_reason.unwrap_or_default());
-                let _ = self.finished.send(());
+            AgentEvent::Done { turn, stop_reason } => {
+                println!("\n[done turn {turn}] {}", stop_reason.unwrap_or_default());
+                if turn == self.prompt_turn {
+                    let _ = self.finished.send(());
+                }
             }
-            AgentEvent::Error { message, .. } => {
-                println!("\n[error] {message}");
-                let _ = self.finished.send(());
+            AgentEvent::Error { turn, message } => {
+                println!("\n[error turn {turn}] {message}");
+                if turn == self.prompt_turn || turn == 0 {
+                    let _ = self.finished.send(());
+                }
             }
         }
     }
@@ -137,11 +144,16 @@ fn main() {
 
     println!("[launch] {} {:?}", plan.binary.display(), plan.args);
 
+    // KLETS_NEW_SESSION replays the launcher's idle reset: New chat, then ask.
+    let new_session_first = std::env::var("KLETS_NEW_SESSION").is_ok();
+    let prompt_turn = if new_session_first { 2 } else { 1 };
+
     let (finished_tx, finished_rx) = std_mpsc::channel();
     let (tx, rx) = mpsc::unbounded_channel();
     let broker = klets_lib::permissions::PermissionBroker::new();
     let sink = PrintSink {
         finished: finished_tx,
+        prompt_turn,
         broker: broker.clone(),
         approve: std::env::var("KLETS_APPROVE")
             .map(|raw| raw.split(',').map(|s| s.trim().to_string()).collect())
@@ -150,7 +162,10 @@ fn main() {
 
     let worker = std::thread::spawn(move || run_agent_thread(sink, plan, broker, rx));
 
-    tx.send(AgentCommand::Prompt { turn: 1, text: prompt })
+    if new_session_first {
+        tx.send(AgentCommand::NewSession { turn: 1 }).expect("send new session");
+    }
+    tx.send(AgentCommand::Prompt { turn: prompt_turn, text: prompt })
         .expect("send prompt");
 
     match finished_rx.recv_timeout(Duration::from_secs(180)) {

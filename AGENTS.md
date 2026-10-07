@@ -270,6 +270,7 @@ KLETS_UNSET=VAR1,VAR2      # clear inherited vars before spawning
 KLETS_POLICY=off|readonly|<anything else = ask-to-run>
 KLETS_PROMPT="..."         # written as AGENTS.md/CLAUDE.md/GEMINI.md
 KLETS_APPROVE=read,search,fetch,execute   # auto-answer Allow for these kinds when asked
+KLETS_NEW_SESSION=1        # send New chat before the prompt, like the launcher's idle reset
 ```
 
 `KLETS_APPROVE` is how policy gets verified end to end: a kind *not* in the

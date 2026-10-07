@@ -537,19 +537,31 @@ pub fn run_agent_thread<S: EventSink>(
     });
 }
 
-/// Spawn the process, run the ACP handshake, then service commands until shutdown.
+/// Write the instruction files, run the agent, and remove them again however
+/// it ends, including a failed spawn or handshake.
 async fn drive_agent<S: EventSink>(
     sink: S,
     plan: LaunchPlan,
     broker: PermissionBroker,
-    mut rx: mpsc::UnboundedReceiver<AgentCommand>,
+    rx: mpsc::UnboundedReceiver<AgentCommand>,
 ) -> Result<(), String> {
     emit_status(&sink, &plan.provider_id, AgentState::Starting, None);
 
     // Written before the agent starts, since instruction files are read when
     // the session opens.
     let instructions = write_instructions(&plan.cwd, &plan.system_prompt);
+    let result = run_session(sink, &plan, broker, rx).await;
+    remove_instructions(&instructions);
+    result
+}
 
+/// Spawn the process, run the ACP handshake, then service commands until shutdown.
+async fn run_session<S: EventSink>(
+    sink: S,
+    plan: &LaunchPlan,
+    broker: PermissionBroker,
+    mut rx: mpsc::UnboundedReceiver<AgentCommand>,
+) -> Result<(), String> {
     let mut command = tokio::process::Command::new(&plan.binary);
     command
         .args(&plan.args)
@@ -632,7 +644,7 @@ async fn drive_agent<S: EventSink>(
         .await
         .map_err(|e| {
             let tail = stderr_snapshot(&stderr_tail);
-            explain(&plan, &format!("{} could not start.", plan.provider_name), &describe(e), &tail)
+            explain(plan, &format!("{} could not start.", plan.provider_name), &describe(e), &tail)
         })?;
 
     let session = connection
@@ -641,7 +653,7 @@ async fn drive_agent<S: EventSink>(
         .map_err(|e| {
             let tail = stderr_snapshot(&stderr_tail);
             explain(
-                &plan,
+                plan,
                 &format!("{} rejected the session.", plan.provider_name),
                 &describe(e),
                 &tail,
@@ -708,6 +720,13 @@ async fn drive_agent<S: EventSink>(
                 {
                     Ok(response) => {
                         session_id = response.session_id.clone();
+                        // Each session starts on the agent's own default model.
+                        if plan.select_model_over_acp {
+                            if let Some(model) = plan.model.as_deref() {
+                                select_model(&sink, turn, &connection, &response, &session_id, model)
+                                    .await;
+                            }
+                        }
                         emit(
                             &sink,
                             AgentEvent::Done {
@@ -730,7 +749,6 @@ async fn drive_agent<S: EventSink>(
     }
 
     let _ = child.kill().await;
-    remove_instructions(&instructions);
     Ok(())
 }
 

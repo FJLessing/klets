@@ -355,3 +355,59 @@ describe("chatstore: cancel and reset", () => {
 		expect(IpcService.cancelTurn).toHaveBeenCalledOnce();
 	});
 });
+
+describe("chatstore: events from other turns", () => {
+	// Regression: the idle reset sends New chat (turn 5), whose `done` only
+	// arrives once the agent's session/new finishes - ~7s for gemini-cli. A
+	// question asked in that window (turn 6) was closed as "No response." and
+	// its real answer then dropped by the streaming guard.
+	it("ignores a new chat's late done while the next question streams", async () => {
+		vi.mocked(IpcService.newChat).mockResolvedValueOnce(5);
+		vi.mocked(IpcService.sendPrompt).mockResolvedValueOnce(6);
+		const store = useChatStore();
+
+		await store.reset();
+		await store.send("what is 2+2?");
+		store.handleEvent({ type: "done", turn: 5, stopReason: "new_session" });
+
+		expect(store.isStreaming).toBe(true);
+		expect(store.currentMessage?.streaming).toBe(true);
+
+		store.handleEvent({ type: "chunk", turn: 6, text: "4" });
+		store.handleEvent({ type: "done", turn: 6, stopReason: "end_turn" });
+
+		expect(store.currentMessage?.text).toBe("4");
+		expect(store.isStreaming).toBe(false);
+	});
+
+	it("ignores a stale done even before the prompt's own turn id is known", async () => {
+		vi.mocked(IpcService.newChat).mockResolvedValueOnce(5);
+		let resolvePrompt: (turn: number) => void = () => {};
+		vi.mocked(IpcService.sendPrompt).mockReturnValueOnce(
+			new Promise((resolve) => {
+				resolvePrompt = resolve;
+			}),
+		);
+		const store = useChatStore();
+
+		await store.reset();
+		const sending = store.send("hello");
+		store.handleEvent({ type: "done", turn: 5, stopReason: "new_session" });
+		store.handleEvent({ type: "chunk", turn: 6, text: "early" });
+		resolvePrompt(6);
+		await sending;
+
+		expect(store.currentMessage?.streaming).toBe(true);
+		expect(store.currentMessage?.text).toBe("early");
+	});
+
+	it("still applies a connection-level error (turn 0) to the active turn", async () => {
+		const store = useChatStore();
+		await store.send("hello");
+
+		store.handleEvent({ type: "error", turn: 0, message: "Gemini could not start." });
+
+		expect(store.isStreaming).toBe(false);
+		expect(store.currentMessage?.error).toBe("Gemini could not start.");
+	});
+});
